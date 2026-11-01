@@ -9,7 +9,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
-    MARKETING_VERSION: "1.3.1"
+    MARKETING_VERSION: "1.3.1-sync"
     CURRENT_PROJECT_VERSION: "13"
     CODE_SIGN_IDENTITY: "-"
     CODE_SIGN_STYLE: Manual
@@ -65,8 +65,8 @@ targets:
         # redirects to the newest release, and appcast.xml and the dmg are
         # assets of the *same* release, so the feed can never advertise a build
         # that is not sitting beside it.
-        SUFeedURL: https://github.com/ReffWu/toknotch/releases/latest/download/appcast.xml
-        SUPublicEDKey: wpcSIsJIvvZPj3jAoJuw8wl0+fVXS3K3ChODZ0W8EBI=
+        # Local build with remote device sync: no feed and no key, so Sparkle
+        # never replaces it with an upstream release (Updater.isConfigured is false).
         # Answers Sparkle's first-run question for the user. Without it the
         # very first launch opens a dialogue asking permission to check for
         # updates — a poor thing to greet somebody with before they have seen

@@ -162,6 +162,15 @@ struct MenuBarPanel: View {
 
     private var actions: some View {
         VStack(spacing: 0) {
+            if RemoteSync.isAvailable {
+                PanelAction(symbol: "desktopcomputer.and.arrow.down",
+                            title: language.t("menu.syncDevices"),
+                            detail: remoteSyncDetail,
+                            detailTint: remoteSyncFailed ? .orange : nil) {
+                    store.syncRemotesNow()
+                }
+                .disabled(store.isSyncingRemotes)
+            }
             PanelAction(symbol: "gearshape", title: language.t("menu.settings"), shortcut: "⌘,",
                         action: onOpenSettings)
                 .keyboardShortcut(",")
@@ -178,6 +187,24 @@ struct MenuBarPanel: View {
             }
             .keyboardShortcut("q")
         }
+    }
+}
+
+extension MenuBarPanel {
+    private var remoteSyncFailed: Bool {
+        guard let outcome = store.remoteSyncOutcome else { return false }
+        return !outcome.failed.isEmpty
+    }
+
+    /// "Syncing…" while it runs; after one started here, how many hosts made
+    /// it if any did not; otherwise when the last sync of either kind landed.
+    private var remoteSyncDetail: String? {
+        if store.isSyncingRemotes { return language.t("menu.syncing") }
+        if let outcome = store.remoteSyncOutcome, !outcome.failed.isEmpty {
+            return language.t("menu.syncPartial", outcome.succeeded.count, outcome.total)
+        }
+        return store.lastRemoteSync?.formatted(.relative(presentation: .named)
+            .locale(language.locale))
     }
 }
 
@@ -367,6 +394,9 @@ private struct PanelAction: View {
     let symbol: String
     let title: String
     var shortcut: String? = nil
+    /// Status shown where a shortcut would be.
+    var detail: String? = nil
+    var detailTint: Color? = nil
     var badge = false
     let action: () -> Void
 
@@ -387,6 +417,13 @@ private struct PanelAction: View {
                     Circle().fill(Color.accentColor).frame(width: 6, height: 6)
                 }
                 Spacer(minLength: 8)
+                if let detail {
+                    Text(verbatim: detail)
+                        .font(.system(size: 11))
+                        .foregroundStyle(detailTint ?? .secondary)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                }
                 if let shortcut {
                     Text(verbatim: shortcut)
                         .font(.system(size: 12))

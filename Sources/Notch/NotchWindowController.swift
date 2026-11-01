@@ -22,6 +22,8 @@ final class NotchWindowController {
     /// Refetch a single provider, asked for by clicking its ring.
     /// Open the settings window, asked for by clicking the handle.
     var onOpenSettings: (() -> Void)?
+    /// Copy other machines' usage over, asked for by clicking the sync handle.
+    var onSyncRemotes: (() -> Void)?
 
     private var panel: NotchPanel?
     private var hostingView: NotchHostingView<NotchRootView>?
@@ -226,6 +228,22 @@ final class NotchWindowController {
         return boxes.dropFirst().reduce(boxes.first ?? .zero) { $0.union($1) }
     }
 
+    /// The sync handle's bounding box, empty on a Mac without the sync script.
+    private var syncRect: CGRect {
+        guard model.showsSyncHandle else { return .null }
+        let side = NotchLayout.orbHotZone
+        return model.syncHandlePoints.map { point -> CGRect in
+            let centre = placement.point(along: model.slack + point.x, across: point.y)
+            return CGRect(x: centre.x - side / 2, y: centre.y - side / 2,
+                          width: side, height: side)
+        }.reduce(.null) { $0.union($1) }
+    }
+
+    private func isOverSync(_ local: CGPoint) -> Bool {
+        model.isOnSyncHandle(along: placement.along(of: local) - model.slack,
+                             across: placement.across(of: local))
+    }
+
     /// Whether the pointer is on the handle itself rather than merely inside
     /// the box that contains it.
     private func isOverHandle(_ local: CGPoint) -> Bool {
@@ -239,7 +257,7 @@ final class NotchWindowController {
     private var liveRect: CGRect {
         guard model.isExpanded else { return pillRect }
         // The orb hangs below the shape, so the live region is both together.
-        return notchRect.union(handleRect)
+        return notchRect.union(handleRect).union(syncRect)
     }
 
     /// The card, its tail, and the gap between the tail and the notch — so
@@ -343,8 +361,13 @@ final class NotchWindowController {
         if model.isHoveringSettings != overHandle {
             model.isHoveringSettings = overHandle
         }
+        let overSync = model.isExpanded && isOverSync(local)
+        if model.isHoveringSync != overSync {
+            model.isHoveringSync = overSync
+        }
         setPointing(
-            Self.wantsPointingHand(isExpanded: model.isExpanded, cellIndex: target) || overHandle
+            Self.wantsPointingHand(isExpanded: model.isExpanded, cellIndex: target)
+                || overHandle || overSync
         )
 
         if let target {
@@ -439,6 +462,11 @@ final class NotchWindowController {
         // it and clicking the gear refetches a provider instead.
         if isOverHandle(local) {
             onOpenSettings?()
+            return
+        }
+        // The same goes for its twin at the near end.
+        if isOverSync(local) {
+            onSyncRemotes?()
             return
         }
         // On the card: open it out, or close it again.

@@ -170,3 +170,8 @@
 "whatsNew.v131.tokscale.title" = "Con tokscale 4.18";
 "whatsNew.version" = "Versión %@";
 "whatsNew.welcome" = "Te damos la bienvenida a TokNotch";
+
+/* Remote device sync (local build) */
+"menu.syncDevices" = "Sync other devices";
+"menu.syncing" = "Syncing…";
+"menu.syncPartial" = "%1$d of %2$d synced";

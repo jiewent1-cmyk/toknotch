@@ -85,6 +85,12 @@ final class NotchViewModel: ObservableObject {
     @Published var isRefreshing = false
     /// The settings handle is under the cursor.
     @Published var isHoveringSettings = false
+    /// The remote-sync handle is under the cursor.
+    @Published var isHoveringSync = false
+    /// Other machines' usage being copied over, driven by the store.
+    @Published var isSyncing = false
+    /// Only on a Mac that has the sync script.
+    let showsSyncHandle = RemoteSync.isAvailable
     /// Which screen edge the notch is welded to. Everything geometric reads
     /// this through `placement` rather than assuming an axis.
     @Published var edge: NotchEdge = .right
@@ -295,6 +301,24 @@ final class NotchViewModel: ObservableObject {
         }
     }
 
+
+    // MARK: Remote-sync handle
+
+    /// The settings handle reflected about the middle of the shape, so it sits
+    /// in the near end's flare (or corner) exactly as the gear does in the far one.
+    var syncHandlePoints: [CGPoint] {
+        orbHandlePoints.map { CGPoint(x: shapeLength - $0.x, y: $0.y) }
+    }
+
+    var syncAlong: CGFloat { shapeLength - orbAlong }
+
+    func isOnSyncHandle(along: CGFloat, across: CGFloat) -> Bool {
+        guard showsSyncHandle else { return false }
+        let radius = NotchLayout.orbHotZone / 2
+        return syncHandlePoints.contains {
+            hypot(along - $0.x, across - $0.y) <= radius
+        }
+    }
 
     /// Where the tooltip's tail tip sits, measured in from the bezel: just off
     /// the inner face of a shape that the extension has made deeper.

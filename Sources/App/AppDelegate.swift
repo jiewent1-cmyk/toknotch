@@ -198,7 +198,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             .sink { [weak coordinator] in coordinator?.setRefreshing($0) }
             .store(in: &cancellables)
 
+        store.$isSyncingRemotes
+            .receive(on: RunLoop.main)
+            .sink { [weak coordinator] in coordinator?.setSyncing($0) }
+            .store(in: &cancellables)
+
         coordinator.onRefresh = { [weak store] in store?.refreshNow(byHand: true) }
+        coordinator.onSyncRemotes = { [weak store] in store?.syncRemotesNow() }
         store.start()
 
         coordinator.start()

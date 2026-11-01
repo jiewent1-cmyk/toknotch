@@ -36,6 +36,22 @@ struct NotchRootView: View {
                         .animation(motion(orbFade), value: model.isExpanded)
                 }
 
+                // The gear's twin at the near end: copies other machines' usage over.
+                if !model.rings.isEmpty, model.showsSyncHandle {
+                    SettingsOrb(isHovered: model.isHoveringSync, edge: model.edge,
+                                convex: model.orbHugsCorner,
+                                arcRadius: model.orbArcRadius,
+                                arcOffset: model.orbArcOffset,
+                                mergeScale: model.isExpanded ? 1 : model.orbMergeScale,
+                                symbol: "arrow.triangle.2.circlepath",
+                                mirrored: true,
+                                isBusy: model.isSyncing)
+                        .position(syncCentre(place))
+                        .animation(motion(orbMotion), value: model.isExpanded)
+                        .opacity(model.isExpanded ? 1 : 0)
+                        .animation(motion(orbFade), value: model.isExpanded)
+                }
+
                 if let ring = model.hoveredRing, let index = model.hoveredIndex,
                    model.isExpanded {
                     TooltipCard(ring: ring, direction: model.edge.tooltipDirection,
@@ -179,6 +195,16 @@ struct NotchRootView: View {
         let travel = model.orbFoldTravel
         return place.point(
             along: model.slack + model.orbAlong + travel.along,
+            across: model.orbInset + travel.across
+        )
+    }
+
+    /// The orb's position reflected along the stack; it rides the near corner
+    /// as the notch folds, so its travel along the stack is reversed too.
+    private func syncCentre(_ place: NotchPlacement) -> CGPoint {
+        let travel = model.orbFoldTravel
+        return place.point(
+            along: model.slack + model.syncAlong - travel.along,
             across: model.orbInset + travel.across
         )
     }

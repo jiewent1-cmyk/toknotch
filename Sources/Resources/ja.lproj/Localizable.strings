@@ -170,3 +170,8 @@
 "whatsNew.v131.tokscale.title" = "tokscale 4.18 を内蔵";
 "whatsNew.version" = "バージョン %@";
 "whatsNew.welcome" = "TokNotch へようこそ";
+
+/* Remote device sync (local build) */
+"menu.syncDevices" = "Sync other devices";
+"menu.syncing" = "Syncing…";
+"menu.syncPartial" = "%1$d of %2$d synced";

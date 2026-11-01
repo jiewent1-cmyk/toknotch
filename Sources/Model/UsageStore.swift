@@ -26,6 +26,13 @@ final class UsageStore: ObservableObject {
     /// Plans found in the tools' own configuration files. Nothing here was
     /// typed by anybody, and nothing here came from a credential store.
     @Published private(set) var detectedPlans: [Vendor: DetectedPlan] = [:]
+    /// Other machines' usage being copied over, by hand.
+    @Published private(set) var isSyncingRemotes = false
+    /// When other machines were last copied over, whoever ran it.
+    @Published private(set) var lastRemoteSync: Date? = RemoteSync.lastRun
+    /// How the last sync started here went. Nil until one has run, or when it
+    /// could not run at all.
+    @Published private(set) var remoteSyncOutcome: RemoteSync.Outcome?
 
     /// Presentation, not data. Changing either re-renders from the digest we
     /// already have rather than shelling out again.
@@ -116,6 +123,26 @@ final class UsageStore: ObservableObject {
         }
     }
 
+    /// Copy the other machines' usage over, then read everything again so it
+    /// shows up straight away instead of at the next tick.
+    func syncRemotesNow() {
+        guard !isSyncingRemotes, RemoteSync.isAvailable else { return }
+        isSyncingRemotes = true
+        Task { [weak self] in
+            do {
+                let outcome = try await RemoteSync.run()
+                self?.remoteSyncOutcome = outcome
+                Log.usage.notice("remote sync: \(outcome.succeeded.count, privacy: .public)/\(outcome.total, privacy: .public) ok")
+            } catch {
+                self?.remoteSyncOutcome = nil
+                Log.usage.error("remote sync failed: \(String(describing: error), privacy: .public)")
+            }
+            self?.lastRemoteSync = RemoteSync.lastRun
+            self?.isSyncingRemotes = false
+            self?.refreshNow(byHand: true)
+        }
+    }
+
     /// Only on a Mac that has Antigravity. A failed sync is logged and
     /// otherwise ignored: the other tools' numbers must not wait on it.
     private func syncAntigravityIfDue(force: Bool) async {
@@ -144,6 +171,8 @@ final class UsageStore: ObservableObject {
             self.problem = nil
             self.lastUpdated = digest.generatedAt
             self.availableVendors = digest.vendors.map(\.vendor)
+            // The half-hourly LaunchAgent syncs without telling us.
+            self.lastRemoteSync = RemoteSync.lastRun
             // Re-read on each refresh: a plan changed in another app should
             // show up here without restarting.
             self.detectedPlans = PlanDetector.detect()

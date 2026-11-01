@@ -15,6 +15,7 @@ final class NotchCoordinator {
 
     var onRefresh: (() -> Void)?
     var onOpenSettings: (() -> Void)?
+    var onSyncRemotes: (() -> Void)?
     var signInItems: [(title: String, action: () -> Void)] = [] {
         didSet {
             for controller in controllers.values {
@@ -26,6 +27,7 @@ final class NotchCoordinator {
 
     private(set) var currentRings: [RingSnapshot] = []
     private(set) var isRefreshing: Bool = false
+    private(set) var isSyncing: Bool = false
     private(set) var edge: NotchEdge = .right
     private(set) var visibility: NotchVisibility = .onHover
 
@@ -95,6 +97,8 @@ final class NotchCoordinator {
         let controller = NotchWindowController(screen: screen)
         controller.onRefresh = { [weak self] in self?.onRefresh?() }
         controller.onOpenSettings = { [weak self] in self?.onOpenSettings?() }
+        controller.onSyncRemotes = { [weak self] in self?.onSyncRemotes?() }
+        controller.model.isSyncing = isSyncing
         controller.signInItems = signInItems
         controller.model.edge = edge
         controller.model.rings = currentRings
@@ -125,6 +129,14 @@ final class NotchCoordinator {
             controller.model.isRefreshing = refreshing
         }
         fallbackController?.model.isRefreshing = refreshing
+    }
+
+    func setSyncing(_ syncing: Bool) {
+        isSyncing = syncing
+        for controller in controllers.values {
+            controller.model.isSyncing = syncing
+        }
+        fallbackController?.model.isSyncing = syncing
     }
 
     func apply(edge: NotchEdge) {
