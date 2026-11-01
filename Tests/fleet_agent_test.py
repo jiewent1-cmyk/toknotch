@@ -167,6 +167,92 @@ class Workers(Base):
         self.assertEqual(self.report()["workers"], [])
 
 
+class Vitals(Base):
+    def sys_file(self, relative, text):
+        path = os.path.join(self.home, "sys", relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+
+    def use_fixture(self):
+        self.agent.SYS_CLASS = os.path.join(self.home, "sys")
+
+    def test_cpu_percent_comes_from_the_interval_between_reads(self):
+        reads = iter([(100, 1000), (150, 1100), (150, 1100), (10, 1200)])
+        sampler = self.agent.CPUSampler(read=lambda: next(reads))
+        self.assertEqual(sampler.percent(), 50.0)
+        self.assertIsNone(sampler.percent())  # no time passed
+        self.assertIsNone(sampler.percent())  # counter went backwards
+
+    def test_cpu_with_no_source_is_unknown_not_zero(self):
+        self.assertIsNone(self.agent.CPUSampler(read=lambda: None).percent())
+
+    def test_proc_stat_counts_iowait_as_idle(self):
+        path = os.path.join(self.home, "stat")
+        with open(path, "w") as handle:
+            handle.write("cpu  10 0 10 70 10 0 0 0 0 0\ncpu0 1 1 1 1 1\n")
+        self.agent.PROC_STAT = path
+        self.assertEqual(self.agent.linux_cpu_times(), (20, 100))
+
+    def test_ryzen_uses_tctl_not_the_hottest_entry(self):
+        self.sys_file("hwmon/hwmon0/name", "k10temp\n")
+        self.sys_file("hwmon/hwmon0/temp1_input", "61250\n")
+        self.sys_file("hwmon/hwmon0/temp1_label", "Tctl\n")
+        self.sys_file("hwmon/hwmon0/temp3_input", "70000\n")
+        self.sys_file("hwmon/hwmon0/temp3_label", "Tccd1\n")
+        self.use_fixture()
+        self.assertEqual(self.agent.linux_temperature(), 61.2)
+
+    def test_gpu_and_disk_sensors_are_not_the_cpu(self):
+        self.sys_file("hwmon/hwmon0/name", "nvme\n")
+        self.sys_file("hwmon/hwmon0/temp1_input", "40000\n")
+        self.sys_file("hwmon/hwmon1/name", "amdgpu\n")
+        self.sys_file("hwmon/hwmon1/temp1_input", "80000\n")
+        self.use_fixture()
+        self.assertIsNone(self.agent.linux_temperature())
+
+    def test_raspberry_pi_thermal_zone(self):
+        self.sys_file("thermal/thermal_zone0/type", "cpu-thermal\n")
+        self.sys_file("thermal/thermal_zone0/temp", "48700\n")
+        self.use_fixture()
+        self.assertEqual(self.agent.linux_temperature(), 48.7)
+
+    def test_nonsense_sensor_values_are_ignored(self):
+        self.sys_file("thermal/thermal_zone0/type", "cpu-thermal\n")
+        self.sys_file("thermal/thermal_zone0/temp", "-1000\n")
+        self.use_fixture()
+        self.assertIsNone(self.agent.linux_temperature())
+
+    def test_mac_picks_hottest_cpu_die_and_skips_calibration_and_battery(self):
+        pick = self.agent.pick_darwin_temperature
+        self.assertEqual(pick({"PMU tdie1": 45.5, "PMU tdie2": 52.04, "PMU tcal": 51.0, "gas gauge battery": 90.0}), 52.0)
+        self.assertEqual(pick({"pACC MTR Temp Sensor1": 60.0, "NAND CH0 temp": 90.0}), 60.0)
+        self.assertEqual(pick({"PMU tcal": 51.0}), None)
+        self.assertEqual(pick({}), None)
+
+    def test_a_failing_temperature_read_does_not_stop_the_report(self):
+        def broken():
+            raise OSError("no sensors")
+        self.write("s1.jsonl", assistant("a", self.now, 5))
+        log = self.agent.SessionLog()
+        log.scan(time.time())
+        host = self.agent.snapshot(log, time.time(), self.agent.Vitals(read_temperature=broken))["host"]
+        self.assertIsNone(host["temperature"])
+        self.assertIn("cpuPercent", host)
+
+    def test_temperature_is_read_less_often_than_cpu(self):
+        calls = []
+        def read():
+            calls.append(1)
+            return 50.0
+        vitals = self.agent.Vitals(read_temperature=read)
+        vitals.read(100.0)
+        vitals.read(102.0)
+        self.assertEqual(len(calls), 1)
+        vitals.read(100.0 + self.agent.TEMPERATURE_INTERVAL)
+        self.assertEqual(len(calls), 2)
+
+
 class Timestamps(Base):
     def test_matches_calendar(self):
         import calendar

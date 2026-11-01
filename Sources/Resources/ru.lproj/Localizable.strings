@@ -204,3 +204,5 @@
 "fleet.session.active" = "Active";
 "fleet.kind.interactive" = "Interactive";
 "fleet.kind.worker" = "Worker";
+"fleet.stat.cpu" = "CPU use";
+"fleet.stat.temperature" = "CPU temperature";

@@ -8,6 +8,10 @@ struct FleetSnapshot: Decodable, Equatable {
         var machine: String
         var cpus: Int
         var load: Double?
+        /// Share of all cores in use, 0–100. Nil if this machine can't say.
+        var cpuPercent: Double?
+        /// CPU temperature in °C. Nil where no sensor could be read.
+        var temperature: Double?
     }
 
     var agentVersion: Int
@@ -26,6 +30,20 @@ struct FleetSnapshot: Decodable, Equatable {
     }
 
     var activeSessions: [FleetSession] { sessions.filter(\.isActive) }
+}
+
+/// How worrying a CPU or temperature reading is.
+enum FleetVitalLevel: Equatable {
+    case normal, warm, hot
+
+    static func cpu(_ percent: Double) -> FleetVitalLevel {
+        percent >= 90 ? .hot : percent >= 70 ? .warm : .normal
+    }
+
+    /// Most of these CPUs start to throttle somewhere in the 80s and 90s.
+    static func temperature(_ degrees: Double) -> FleetVitalLevel {
+        degrees >= 90 ? .hot : degrees >= 75 ? .warm : .normal
+    }
 }
 
 struct FleetUsage: Decodable, Equatable {

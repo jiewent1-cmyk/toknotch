@@ -14,24 +14,37 @@ Standard library only, Python 3.9 or newer.
 Output is one JSON object per line. `--once` prints a single snapshot.
 """
 
+import ctypes
+import glob
 import json
 import os
 import platform
 import re
+import select
+import signal
 import socket
 import sys
 import time
 
-AGENT_VERSION = 1
+AGENT_VERSION = 2
 SCAN_INTERVAL = 2.0  # how often known session files are checked for growth
 WALK_INTERVAL = 15.0  # how often the tree is walked for new session files
-HEARTBEAT = 10.0  # longest gap between snapshots, so silence means trouble
+HEARTBEAT = 5.0  # longest gap between snapshots, so CPU and temperature stay current
+TEMPERATURE_INTERVAL = 10.0  # temperature changes slowly and costs more to read
 SESSION_WINDOW = 6 * 3600  # sessions quieter than this are left out of the list
 MAX_SESSIONS = 60
 FINISHED_JOB_WINDOW = 3600  # how long a finished worker stays listed
 JOB_WINDOW = 7 * 86400  # older job folders are ignored without being read
 TITLE_LENGTH = 60
 READ_CHUNK = 1 << 20
+
+# Where Linux publishes CPU and sensor data. Tests point these at a fixture.
+PROC_STAT = "/proc/stat"
+SYS_CLASS = "/sys/class"
+# Sensor drivers that measure the CPU itself, best first.
+LINUX_CPU_SENSORS = ("coretemp", "k10temp", "zenpower", "cpu_thermal", "cpu-thermal", "soc_thermal")
+LINUX_CPU_ZONES = ("x86_pkg_temp", "cpu-thermal", "cpu_thermal", "soc-thermal", "soc_thermal", "cpu", "acpitz")
+LINUX_CPU_LABELS = ("tctl", "tdie", "package id 0")
 
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(HOME, ".claude", "projects")
@@ -396,6 +409,270 @@ def _run_id_for(runs, pid):
     return max(matches)[: -len(".prompt.md")] if matches else None
 
 
+def linux_cpu_times():
+    """(busy, total) ticks since boot, from the first line of /proc/stat."""
+    text = _read_text(PROC_STAT)
+    if not text or not text.startswith("cpu "):
+        return None
+    try:
+        # user nice system idle iowait irq softirq steal
+        ticks = [int(field) for field in text.splitlines()[0].split()[1:9]]
+    except ValueError:
+        return None
+    if len(ticks) < 5:
+        return None
+    total = sum(ticks)
+    return total - ticks[3] - ticks[4], total
+
+
+class _DarwinCPU:
+    """(busy, total) ticks from Mach's host_statistics, a public interface."""
+
+    HOST_CPU_LOAD_INFO = 3
+
+    def __init__(self):
+        self.libc = ctypes.CDLL(None)
+        self.libc.mach_host_self.restype = ctypes.c_uint
+        self.host = self.libc.mach_host_self()
+
+    def __call__(self):
+        info = (ctypes.c_uint * 4)()  # user, system, idle, nice
+        count = ctypes.c_uint(4)
+        status = self.libc.host_statistics(
+            ctypes.c_uint(self.host), self.HOST_CPU_LOAD_INFO, info, ctypes.byref(count))
+        if status != 0:
+            return None
+        total = sum(info)
+        return total - info[2], total
+
+
+class CPUSampler:
+    """CPU use as a percentage of all cores, over the time between two reads."""
+
+    def __init__(self, read=None):
+        self.read = read if read is not None else self._reader()
+        self.previous = self._read()
+
+    @staticmethod
+    def _reader():
+        if sys.platform.startswith("linux"):
+            return linux_cpu_times
+        if sys.platform == "darwin":
+            try:
+                return _DarwinCPU()
+            except (OSError, AttributeError):
+                pass
+        return lambda: None
+
+    def _read(self):
+        try:
+            return self.read()
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def percent(self):
+        current = self._read()
+        previous, self.previous = self.previous, current
+        if not current or not previous:
+            return None
+        total = current[1] - previous[1]
+        busy = current[0] - previous[0]
+        if total <= 0 or busy < 0:
+            return None  # no time passed, or a counter wrapped
+        return round(min(100.0, 100.0 * busy / total), 1)
+
+
+def _sensor_value(path):
+    """A sysfs temperature in degrees, or None. They are stored in millidegrees."""
+    text = _read_text(path, 32)
+    try:
+        value = int((text or "").strip()) / 1000.0
+    except ValueError:
+        return None
+    return value if 0 < value < 130 else None
+
+
+def linux_temperature():
+    """CPU temperature in degrees: a CPU sensor driver, then a CPU thermal zone."""
+    found = {}
+    for folder in glob.glob(os.path.join(SYS_CLASS, "hwmon", "hwmon*")):
+        name = (_read_text(os.path.join(folder, "name"), 64) or "").strip()
+        if name not in LINUX_CPU_SENSORS:
+            continue
+        labelled, others = None, []
+        for path in glob.glob(os.path.join(folder, "temp*_input")):
+            value = _sensor_value(path)
+            if value is None:
+                continue
+            label = (_read_text(path.replace("_input", "_label"), 64) or "").strip().lower()
+            if label in LINUX_CPU_LABELS and labelled is None:
+                labelled = value
+            others.append(value)
+        if labelled is not None or others:
+            found[name] = labelled if labelled is not None else max(others)
+    for name in LINUX_CPU_SENSORS:
+        if name in found:
+            return round(found[name], 1)
+    zones = {}
+    for folder in glob.glob(os.path.join(SYS_CLASS, "thermal", "thermal_zone*")):
+        kind = (_read_text(os.path.join(folder, "type"), 64) or "").strip()
+        value = _sensor_value(os.path.join(folder, "temp"))
+        if value is not None:
+            zones.setdefault(kind, value)
+    for kind in LINUX_CPU_ZONES:
+        if kind in zones:
+            return round(zones[kind], 1)
+    return None
+
+
+def _darwin_sensors():
+    """Sensor name to degrees, through IOKit's private HID event interface.
+
+    Apple offers no public way to read this without root.
+    """
+    void = ctypes.c_void_p
+    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    io = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+    utf8 = 0x08000100
+    temperature_event = 15
+
+    cf.CFStringCreateWithCString.restype = void
+    cf.CFStringCreateWithCString.argtypes = [void, ctypes.c_char_p, ctypes.c_uint32]
+    cf.CFNumberCreate.restype = void
+    cf.CFNumberCreate.argtypes = [void, ctypes.c_long, void]
+    cf.CFDictionaryCreate.restype = void
+    cf.CFDictionaryCreate.argtypes = [void, void, void, ctypes.c_long, void, void]
+    cf.CFArrayGetCount.restype = ctypes.c_long
+    cf.CFArrayGetCount.argtypes = [void]
+    cf.CFArrayGetValueAtIndex.restype = void
+    cf.CFArrayGetValueAtIndex.argtypes = [void, ctypes.c_long]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFStringGetCString.argtypes = [void, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+    io.IOHIDEventSystemClientCreate.restype = void
+    io.IOHIDEventSystemClientCreate.argtypes = [void]
+    io.IOHIDEventSystemClientSetMatching.argtypes = [void, void]
+    io.IOHIDEventSystemClientCopyServices.restype = void
+    io.IOHIDEventSystemClientCopyServices.argtypes = [void]
+    io.IOHIDServiceClientCopyProperty.restype = void
+    io.IOHIDServiceClientCopyProperty.argtypes = [void, void]
+    io.IOHIDServiceClientCopyEvent.restype = void
+    io.IOHIDServiceClientCopyEvent.argtypes = [void, ctypes.c_int64, ctypes.c_int32, ctypes.c_int64]
+    io.IOHIDEventGetFloatValue.restype = ctypes.c_double
+    io.IOHIDEventGetFloatValue.argtypes = [void, ctypes.c_int32]
+
+    def cfstr(text):
+        return cf.CFStringCreateWithCString(None, text, utf8)
+
+    def cfint(value):
+        number = ctypes.c_int32(value)
+        return cf.CFNumberCreate(None, 3, ctypes.byref(number))  # kCFNumberSInt32Type
+
+    # Apple's vendor usage page for temperature sensors.
+    keys = (void * 2)(cfstr(b"PrimaryUsagePage"), cfstr(b"PrimaryUsage"))
+    values = (void * 2)(cfint(0xff00), cfint(5))
+    matching = cf.CFDictionaryCreate(None, keys, values, 2, None, None)
+    client = io.IOHIDEventSystemClientCreate(None)
+    if not client:
+        return {}
+    io.IOHIDEventSystemClientSetMatching(client, matching)
+    services = io.IOHIDEventSystemClientCopyServices(client)
+    if not services:
+        return {}
+    product = cfstr(b"Product")
+    sensors = {}
+    for index in range(cf.CFArrayGetCount(services)):
+        service = cf.CFArrayGetValueAtIndex(services, index)
+        name_ref = io.IOHIDServiceClientCopyProperty(service, product)
+        event = io.IOHIDServiceClientCopyEvent(service, temperature_event, 0, 0)
+        if not name_ref or not event:
+            continue
+        buffer = ctypes.create_string_buffer(128)
+        if cf.CFStringGetCString(name_ref, buffer, 128, utf8):
+            sensors[buffer.value.decode("utf-8", "replace")] = io.IOHIDEventGetFloatValue(
+                event, temperature_event << 16)
+    return sensors
+
+
+def pick_darwin_temperature(sensors):
+    """The hottest CPU die reading. Calibration entries are constants, so skip them."""
+    usable = {name: value for name, value in sensors.items()
+              if 0 < value < 130 and "tcal" not in name.lower()}
+    cpu = [value for name, value in usable.items()
+           if "tdie" in name.lower() or "ACC MTR" in name or "CPU" in name]
+    if cpu:
+        return round(max(cpu), 1)
+    other = [value for name, value in usable.items()
+             if not re.search(r"battery|gas gauge|nand", name, re.IGNORECASE)]
+    return round(max(other), 1) if other else None
+
+
+def darwin_temperature(timeout=3.0):
+    """Read Mac sensors in a forked child, so a change in Apple's private
+    interface can cost a temperature reading but never the agent."""
+    try:
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+    except OSError:
+        return None
+    if pid == 0:
+        status = 1
+        try:
+            os.close(read_end)
+            value = pick_darwin_temperature(_darwin_sensors())
+            os.write(write_end, str(value).encode())
+            status = 0
+        finally:
+            os._exit(status)
+    os.close(write_end)
+    try:
+        ready, _, _ = select.select([read_end], [], [], timeout)
+        text = os.read(read_end, 64).decode() if ready else ""
+    except OSError:
+        text = ""
+    finally:
+        os.close(read_end)
+    try:
+        if not text:
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def read_temperature():
+    if sys.platform.startswith("linux"):
+        return linux_temperature()
+    if sys.platform == "darwin":
+        return darwin_temperature()
+    return None
+
+
+class Vitals:
+    """CPU use and temperature, with temperature read less often."""
+
+    def __init__(self, read_temperature=read_temperature):
+        self.cpu = CPUSampler()
+        self.read_temperature = read_temperature
+        self.temperature = None
+        self.temperature_at = None
+
+    def read(self, now):
+        if self.temperature_at is None or now - self.temperature_at >= TEMPERATURE_INTERVAL:
+            self.temperature_at = now
+            try:
+                self.temperature = self.read_temperature()
+            except (OSError, ValueError, AttributeError):
+                self.temperature = None
+        return {"cpuPercent": self.cpu.percent(), "temperature": self.temperature}
+
+
 def host_info():
     try:
         load = os.getloadavg()[0]
@@ -410,11 +687,14 @@ def host_info():
     }
 
 
-def snapshot(log, now):
+def snapshot(log, now, vitals=None):
     sessions, models = log.report(now)
+    host = host_info()
+    if vitals is not None:
+        host.update(vitals.read(now))
     return {
         "agentVersion": AGENT_VERSION,
-        "host": host_info(),
+        "host": host,
         "sessions": sessions,
         "todayByModel": models,
         "workers": local_workers(now) + remote_jobs(now),
@@ -428,14 +708,16 @@ def main(argv):
         except OSError:
             pass
     log = SessionLog()
+    vitals = Vitals()
+    time.sleep(0.25)  # so the first CPU reading has an interval to measure
     once = "--once" in argv
     last_body = None
     last_sent = 0.0
     while True:
         now = time.time()
         log.scan(now)
-        report = snapshot(log, now)
-        # Ages and load change on every pass, so they don't count as news.
+        report = snapshot(log, now, vitals)
+        # Ages and machine load change on every pass, so they don't count as news.
         body = json.dumps(_without_clock(report), sort_keys=True)
         if once or body != last_body or now - last_sent >= HEARTBEAT:
             try:
@@ -451,7 +733,7 @@ def main(argv):
 
 def _without_clock(report):
     stable = dict(report)
-    stable["host"] = {k: v for k, v in report["host"].items() if k != "load"}
+    stable["host"] = {k: v for k, v in report["host"].items() if k not in ("load", "cpuPercent", "temperature")}
     stable["sessions"] = [{k: v for k, v in s.items() if k != "idleSeconds"} for s in report["sessions"]]
     stable["workers"] = [{k: v for k, v in w.items() if k != "elapsedSeconds"} for w in report["workers"]]
     return stable

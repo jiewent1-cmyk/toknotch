@@ -3,7 +3,7 @@ import XCTest
 
 final class FleetTests: XCTestCase {
     private let sample = """
-    {"agentVersion":1,"host":{"hostname":"box","system":"Linux","machine":"x86_64","cpus":16,"load":1.5},
+    {"agentVersion":1,"host":{"hostname":"box","system":"Linux","machine":"x86_64","cpus":16,"load":1.5,"cpuPercent":42.5,"temperature":61.2},
     "sessions":[{"id":"a","title":"t","kind":"interactive","model":"m","cwd":"~/x","lastTool":"Bash","idleSeconds":5,
     "usage":{"input":1,"output":2,"cacheRead":3,"cacheWrite":4}},
     {"id":"b","title":"","kind":"worker","model":"m","cwd":"","lastTool":"","idleSeconds":500,
@@ -18,6 +18,37 @@ final class FleetTests: XCTestCase {
         let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: Data(sample.utf8)))
         XCTAssertEqual(snapshot.todayTotal, 20)
         XCTAssertEqual(snapshot.activeSessions.map(\.id), ["a"])
+    }
+
+    func testReadsCPUAndTemperature() throws {
+        let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: Data(sample.utf8)))
+        XCTAssertEqual(snapshot.host.cpuPercent, 42.5)
+        XCTAssertEqual(snapshot.host.temperature, 61.2)
+    }
+
+    /// A machine with no readable sensor still reports, and shows a dash rather than 0.
+    func testMissingVitalsAreUnknownNotZero() throws {
+        let without = sample.replacingOccurrences(of: ",\"cpuPercent\":42.5,\"temperature\":61.2", with: "")
+        let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: Data(without.utf8)))
+        XCTAssertNil(snapshot.host.cpuPercent)
+        XCTAssertNil(snapshot.host.temperature)
+        XCTAssertEqual(FleetText.percent(snapshot.host.cpuPercent), "—")
+        XCTAssertEqual(FleetText.degrees(snapshot.host.temperature), "—")
+    }
+
+    func testVitalLevels() {
+        XCTAssertEqual(FleetVitalLevel.cpu(69.9), .normal)
+        XCTAssertEqual(FleetVitalLevel.cpu(70), .warm)
+        XCTAssertEqual(FleetVitalLevel.cpu(90), .hot)
+        XCTAssertEqual(FleetVitalLevel.temperature(74.9), .normal)
+        XCTAssertEqual(FleetVitalLevel.temperature(75), .warm)
+        XCTAssertEqual(FleetVitalLevel.temperature(90), .hot)
+    }
+
+    func testVitalsRoundForDisplay() {
+        XCTAssertEqual(FleetText.percent(42.4), "42%")
+        XCTAssertEqual(FleetText.percent(42.5), "43%")
+        XCTAssertEqual(FleetText.degrees(61.6), "62°C")
     }
 
     /// A worker sent to another machine belongs to that machine's count.

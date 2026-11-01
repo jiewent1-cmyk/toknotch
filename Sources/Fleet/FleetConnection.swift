@@ -18,7 +18,7 @@ final class FleetConnection: @unchecked Sendable {
     var onLink: ((FleetLink) -> Void)?
     var onSnapshot: ((FleetSnapshot) -> Void)?
 
-    /// A silent agent is a dead link: it reports at least every 10 seconds, so
+    /// A silent agent is a dead link: it reports at least every 5 seconds, so
     /// this long without a line means a connection that has quietly gone away.
     static let silenceLimit: TimeInterval = 35
 

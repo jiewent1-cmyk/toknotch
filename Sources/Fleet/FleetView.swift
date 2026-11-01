@@ -68,6 +68,14 @@ private struct FleetDeviceRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            Spacer(minLength: 4)
+            if state.isLive, let host = state.snapshot?.host {
+                VStack(alignment: .trailing, spacing: 1) {
+                    FleetCPUText(percent: host.cpuPercent)
+                    FleetTemperatureText(degrees: host.temperature)
+                }
+                .font(.caption.monospacedDigit())
+            }
         }
     }
 
@@ -98,7 +106,45 @@ private struct FleetLinkDot: View {
     }
 }
 
+/// Live readings are never shown for a machine that has gone offline: an old
+/// number there would look like a current one.
+private struct FleetCPUText: View {
+    let percent: Double?
+
+    var body: some View {
+        Text(verbatim: FleetText.percent(percent))
+            .foregroundStyle(percent.map { FleetText.tint(FleetVitalLevel.cpu($0)) } ?? .secondary)
+    }
+}
+
+private struct FleetTemperatureText: View {
+    let degrees: Double?
+
+    var body: some View {
+        Text(verbatim: FleetText.degrees(degrees))
+            .foregroundStyle(degrees.map { FleetText.tint(FleetVitalLevel.temperature($0)) } ?? .secondary)
+    }
+}
+
 enum FleetText {
+    static let unknown = "—"
+
+    static func percent(_ value: Double?) -> String {
+        value.map { "\(Int($0.rounded()))%" } ?? unknown
+    }
+
+    static func degrees(_ value: Double?) -> String {
+        value.map { "\(Int($0.rounded()))°C" } ?? unknown
+    }
+
+    static func tint(_ level: FleetVitalLevel) -> Color {
+        switch level {
+        case .normal: return .secondary
+        case .warm: return .orange
+        case .hot: return .red
+        }
+    }
+
     static func linkKey(_ link: FleetLink) -> String {
         switch link {
         case .live: return "fleet.link.live"
@@ -166,11 +212,12 @@ private struct FleetDeviceCard: View {
                     .font(.headline)
                     .lineLimit(1)
                 Spacer(minLength: 4)
-                if let load = state.snapshot?.host.load, state.isLive {
-                    Text(verbatim: String(format: "%.1f", load))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .help(language.t("fleet.load"))
+                if state.isLive, let host = state.snapshot?.host {
+                    HStack(spacing: 8) {
+                        FleetCPUText(percent: host.cpuPercent)
+                        FleetTemperatureText(degrees: host.temperature)
+                    }
+                    .font(.callout.monospacedDigit())
                 }
             }
             if let snapshot = state.snapshot {
@@ -207,6 +254,13 @@ private struct FleetDeviceCard: View {
 private struct FleetStat: View {
     let title: String
     let value: String
+    /// Colours the value when it is worth noticing.
+    var level: FleetVitalLevel? = nil
+
+    private var valueColor: Color {
+        guard let level, level != .normal else { return .primary }
+        return FleetText.tint(level)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -216,6 +270,7 @@ private struct FleetStat: View {
                 .lineLimit(1)
             Text(verbatim: value)
                 .font(.title2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(valueColor)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
         }
@@ -236,6 +291,12 @@ private struct FleetDeviceDetail: View {
             header
             if let snapshot = state.snapshot {
                 HStack(spacing: 12) {
+                    FleetStat(title: language.t("fleet.stat.cpu"),
+                              value: FleetText.percent(state.isLive ? snapshot.host.cpuPercent : nil),
+                              level: state.isLive ? snapshot.host.cpuPercent.map(FleetVitalLevel.cpu) : nil)
+                    FleetStat(title: language.t("fleet.stat.temperature"),
+                              value: FleetText.degrees(state.isLive ? snapshot.host.temperature : nil),
+                              level: state.isLive ? snapshot.host.temperature.map(FleetVitalLevel.temperature) : nil)
                     FleetStat(title: language.t("fleet.stat.today"),
                               value: UsageFormat.tokens(snapshot.todayTotal, language))
                     FleetStat(title: language.t("fleet.stat.activeSessions"),
