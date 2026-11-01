@@ -18,6 +18,8 @@ struct SettingsView: View {
     var startingPage: Page? = nil
     /// Opens the About window, from the version line at the foot of Settings.
     var onAbout: () -> Void = {}
+    /// Opens the Fleet window, from the foot of the sidebar's page list.
+    var onOpenFleet: () -> Void = {}
 
     enum Page: String, CaseIterable, Identifiable {
         case payback, settings
@@ -101,6 +103,25 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.plain)
             }
+
+            // Not a page: it opens its own window, as the arrow says.
+            Button(action: onOpenFleet) {
+                HStack(alignment: .center, spacing: 10) {
+                    SettingsIcon(symbol: "server.rack", tint: .blue)
+                    Text(language.t("fleet.open"))
+                        .font(.system(size: 13))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.forward.app")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 9)

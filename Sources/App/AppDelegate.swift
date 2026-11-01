@@ -129,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
         let fleet = FleetWindowController(store: FleetStore(), preferences: preferences)
         self.fleet = fleet
+        settings.onOpenFleet = { [weak fleet] in fleet?.show() }
         // The notch's right-click menu is the way in on a Mac whose hardware
         // notch hides the menu bar icon. These items are not only for signing
         // in: the menu lists whatever is put here after Refresh.
@@ -148,6 +149,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             forName: NSNotification.Name("com.reffwu.toknotch.openSettings"),
             object: nil, queue: .main
         ) { [weak settings] _ in settings?.show() }
+
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.reffwu.toknotch.openFleet"),
+            object: nil, queue: .main
+        ) { [weak fleet] _ in MainActor.assumeIsolated { fleet?.show() } }
 
         preferences.$showsInDock
             .receive(on: RunLoop.main)
@@ -240,9 +246,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         return true
     }
 
+    /// Right-clicking the Dock icon. Clicking it opens Settings.
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        let item = NSMenuItem(title: preferences?.appLanguage.t("fleet.open") ?? "Fleet…",
+                              action: #selector(openFleetFromMenu), keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        return menu
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         store?.stop()
         notchCoordinator?.stop()
+    }
+
+    @objc @MainActor func openFleetFromMenu() {
+        fleet?.show()
     }
 
     @objc @MainActor func openSettingsFromMenu() {
@@ -266,6 +286,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(settingsItem)
+        let fleetItem = NSMenuItem(title: "Fleet…", action: #selector(openFleetFromMenu), keyEquivalent: "f")
+        fleetItem.keyEquivalentModifierMask = [.command, .shift]
+        fleetItem.target = self
+        appMenu.addItem(fleetItem)
         appMenu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit TokNotch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenu.addItem(quitItem)

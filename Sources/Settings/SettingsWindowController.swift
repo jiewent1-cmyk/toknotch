@@ -16,6 +16,8 @@ final class SettingsWindowController {
     private let updater: Updater
     /// Set by the app delegate, which owns the About window.
     var onAbout: () -> Void = {}
+    /// Set by the app delegate, which owns the Fleet window.
+    var onOpenFleet: () -> Void = {}
 
     init(preferences: Preferences, store: UsageStore, updater: Updater) {
         self.preferences = preferences
@@ -63,7 +65,8 @@ final class SettingsWindowController {
         window.titlebarAppearsTransparent = true
         window.contentView = NSHostingView(
             rootView: SettingsView(preferences: preferences, store: store, updater: updater,
-                                   onAbout: { [weak self] in self?.onAbout() })
+                                   onAbout: { [weak self] in self?.onAbout() },
+                                   onOpenFleet: { [weak self] in self?.onOpenFleet() })
         )
         window.center()
         window.isReleasedWhenClosed = false
