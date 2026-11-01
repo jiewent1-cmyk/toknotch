@@ -359,6 +359,14 @@ def provider_env(provider, base):
     return env
 
 
+def has_key(provider):
+    if provider == "claude":
+        return True
+    values = dict(os.environ)
+    values.update(read_env_file(env_file(provider)))
+    return bool(values.get(KEY_VARS[provider][1], "").strip())
+
+
 def find_claude():
     found = shutil.which("claude")
     if found:
@@ -877,8 +885,10 @@ class Dispatcher(object):
             return [self.o.backend]
         order = self.rules["order"]
         allowed = self.rules["levels"][self.level]
+        # No key here means nothing to try. Probing anyway would only take a slot,
+        # fail, and leave a cooldown that reads like a fault.
         names = [name for name in order
-                 if self.rules["providers"][name]["enabled"] and name in allowed]
+                 if self.rules["providers"][name]["enabled"] and name in allowed and has_key(name)]
         if self.rules["balance"] == "priority":
             return names
         return sorted(names, key=lambda name: (Fraction(self.used(name), self.limit(name)),

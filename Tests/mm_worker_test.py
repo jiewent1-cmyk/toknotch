@@ -936,6 +936,37 @@ class Rules(Base):
 
 # ---------- environment, arguments, prompt and ledger ----------
 
+class MissingKeys(Base):
+    def test_a_provider_without_a_key_gets_no_automatic_work(self):
+        os.unlink(os.path.join(self.home, ".config/minimax/env"))
+        done = self.mw("-l", "normal", "x")
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertEqual(self.records("minimax"), [])
+        state = os.listdir(os.path.join(self.home, ".cache/mm-worker"))
+        self.assertNotIn("minimax_unavailable_until", state)
+
+    def test_an_empty_key_counts_as_none(self):
+        with open(os.path.join(self.home, ".config/minimax/env"), "w") as handle:
+            handle.write("MINIMAX_API_HOST=http://127.0.0.1:9\nMINIMAX_API_KEY=\n")
+        done = self.mw("-l", "normal", "x")
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertEqual(self.records("minimax"), [])
+
+    def test_with_no_keys_at_all_claude_still_runs(self):
+        for provider in ("minimax", "zhipu", "qwen"):
+            path = os.path.join(self.home, ".config", provider, "env")
+            if os.path.exists(path):
+                os.unlink(path)
+        done = self.mw("-l", "simple", "x")
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertEqual(len(self.records("claude")), 1)
+
+    def test_a_forced_provider_without_a_key_still_fails_clearly(self):
+        os.unlink(os.path.join(self.home, ".config/minimax/env"))
+        done = self.mw("-b", "minimax", "x")
+        self.assertNotEqual(done.returncode, 0)
+
+
 class Environment(Base):
     def test_provider_environments(self):
         self.mw("-b", "minimax", "x")
