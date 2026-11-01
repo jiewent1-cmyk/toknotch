@@ -19,6 +19,8 @@ struct FleetSnapshot: Decodable, Equatable {
     var sessions: [FleetSession]
     var todayByModel: [String: FleetUsage]
     var workers: [FleetWorker]
+    /// This machine's dispatcher and rules. Absent from an older agent.
+    var dispatcher: FleetDispatcher?
 
     /// Today's tokens across every model.
     var todayTotal: Int64 { todayByModel.values.reduce(0) { $0 + $1.total } }
@@ -148,6 +150,7 @@ enum FleetConfig {
 
     static var path: String { NSHomeDirectory() + "/.config/toknotch/fleet.json" }
     static let thisMac = FleetDevice(id: "local", label: "This Mac")
+    private static let limitsKey = "accountLimits"
 
     /// With no file, or an unreadable one, the fleet is just this Mac.
     static func load(from path: String = FleetConfig.path) -> [FleetDevice] {
@@ -157,9 +160,77 @@ enum FleetConfig {
         else { return [thisMac] }
         return file.devices
     }
+
+    /// What each account allows, by provider. Read apart from `devices`, so a
+    /// problem with one can't take the other with it.
+    static func loadAccountLimits(from path: String = FleetConfig.path) -> [String: Int] {
+        guard let data = FileManager.default.contents(atPath: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let limits = object[limitsKey] as? [String: Any]
+        else { return [:] }
+        return limits.compactMapValues { value in
+            // A JSON `true` also arrives as an NSNumber, but it is no limit.
+            guard let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.intValue > 0
+            else { return nil }
+            return number.intValue
+        }
+    }
+
+    enum WriteError: Error, Equatable {
+        /// The file exists but isn't a JSON object, so writing would destroy it.
+        case unreadable
+    }
+
+    /// Sets or, with nil, removes one provider's limit, leaving `devices` and
+    /// every other key as they are. Reads the file afresh, as it may have been
+    /// edited by hand since the app last looked.
+    static func setAccountLimit(_ limit: Int?, provider: String,
+                                at path: String = FleetConfig.path) throws {
+        // Write through a symlink rather than replacing it, for managed dotfiles.
+        let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        let manager = FileManager.default
+        var object: [String: Any] = [:]
+        if manager.fileExists(atPath: url.path) {
+            let data = try Data(contentsOf: url)
+            guard let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { throw WriteError.unreadable }
+            object = existing
+        }
+        var limits = object[limitsKey] as? [String: Any] ?? [:]
+        limits[provider] = limit
+        object[limitsKey] = limits.isEmpty ? nil : limits
+
+        let data = try JSONSerialization.data(withJSONObject: object,
+                                              options: [.prettyPrinted, .sortedKeys])
+        let permissions = (try? manager.attributesOfItem(atPath: url.path))?[.posixPermissions]
+        try manager.createDirectory(at: url.deletingLastPathComponent(),
+                                    withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+        if let permissions {
+            try? manager.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
+        }
+    }
 }
 
 extension FleetSnapshot {
+    private enum CodingKeys: String, CodingKey {
+        case agentVersion, host, sessions, todayByModel, workers, dispatcher
+    }
+
+    /// A `dispatcher` that can't be read is treated as absent: the rest of the
+    /// report is still good, and losing a whole line would look like a dead link.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        agentVersion = try container.decode(Int.self, forKey: .agentVersion)
+        host = try container.decode(Host.self, forKey: .host)
+        sessions = try container.decode([FleetSession].self, forKey: .sessions)
+        todayByModel = try container.decode([String: FleetUsage].self, forKey: .todayByModel)
+        workers = try container.decode([FleetWorker].self, forKey: .workers)
+        dispatcher = (try? container.decodeIfPresent(FleetDispatcher.self, forKey: .dispatcher)) ?? nil
+    }
+
     /// Decodes one output line. Nil for anything else ssh or a shell profile
     /// may have printed, which must not end the connection.
     static func decode(line: Data) -> FleetSnapshot? {

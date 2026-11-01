@@ -130,7 +130,8 @@ enum FleetText {
     static let unknown = "—"
 
     static func percent(_ value: Double?) -> String {
-        value.map { "\(Int($0.rounded()))%" } ?? unknown
+        // A big idle machine really does sit below 1%; "0%" would read as no data.
+        value.map { $0 < 1 ? "<1%" : "\(Int($0.rounded()))%" } ?? unknown
     }
 
     static func degrees(_ value: Double?) -> String {
@@ -216,6 +217,7 @@ private struct FleetOverview: View {
                     .buttonStyle(.plain)
                 }
             }
+            FleetProviderTotalsSection(store: store, language: language)
         }
     }
 }
@@ -329,6 +331,8 @@ private struct FleetDeviceDetail: View {
                 models(snapshot)
                 workers(snapshot)
                 sessions(snapshot)
+                FleetRulesSection(state: state, dispatcher: snapshot.dispatcher,
+                                  store: store, language: language)
             }
         }
         // Stopping a task can't be undone and may leave its work half done.
@@ -445,7 +449,7 @@ private struct FleetDeviceDetail: View {
     }
 }
 
-private struct FleetSection<Content: View>: View {
+struct FleetSection<Content: View>: View {
     let title: String
     @ViewBuilder let content: Content
 

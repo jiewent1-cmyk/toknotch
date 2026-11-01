@@ -16,6 +16,16 @@ struct FleetDeviceState: Identifiable, Equatable {
     }
 }
 
+/// Something to tell the user about a device's rules, until the next action.
+enum FleetRulesNotice: Equatable {
+    /// A save or reset was refused, and the machine's own rules are now showing.
+    case conflict
+    case saved
+    case saveFailed(FleetCommandFailure)
+    case installed
+    case installFailed(FleetCommandFailure)
+}
+
 /// Publishes every device's state. Connections run only while something is
 /// looking, so a closed window costs the remote machines nothing.
 @MainActor
@@ -25,21 +35,48 @@ final class FleetStore: ObservableObject {
     @Published private(set) var cancelling: Set<String> = []
     /// Why the last cancellation failed, until somebody has read it.
     @Published var cancelError: String?
+    /// Rules being edited, by device id. Survives a closed window and a lost link.
+    @Published private(set) var rulesEditors: [String: FleetRulesEditor] = [:]
+    @Published private(set) var rulesNotices: [String: FleetRulesNotice] = [:]
+    /// Devices whose dispatcher is being replaced.
+    @Published private(set) var installing: Set<String> = []
+    /// By provider, from `fleet.json`.
+    @Published private(set) var accountLimits: [String: Int]
+    /// The last limit could not be written.
+    @Published var accountLimitFailed = false
     private var connections: [String: FleetConnection] = [:]
     private var users = 0
     private let script: Data?
+    private let dispatcherFile: Data?
+    /// Nil for a fixture, which has no file to write to.
+    private let configPath: String?
+    private let isFixture: Bool
 
     init(devices: [FleetDevice] = FleetConfig.load(),
-         script: Data? = FleetStore.bundledScript()) {
+         script: Data? = FleetStore.bundledScript(),
+         dispatcherFile: Data? = FleetStore.bundledDispatcher(),
+         configPath: String = FleetConfig.path) {
         self.devices = devices.map { FleetDeviceState(device: $0) }
         self.script = script
+        self.dispatcherFile = dispatcherFile
+        self.configPath = configPath
+        accountLimits = FleetConfig.loadAccountLimits(from: configPath)
+        isFixture = false
     }
 
     /// Already holds the given states and makes no connections. For previews and
-    /// rendering checks.
-    init(fixture: [FleetDeviceState]) {
+    /// rendering checks. Giving a script and a file shows the controls as enabled.
+    init(fixture: [FleetDeviceState], script: Data? = nil, dispatcherFile: Data? = nil,
+         accountLimits: [String: Int] = [:]) {
         devices = fixture
-        script = nil
+        self.script = script
+        self.dispatcherFile = dispatcherFile
+        configPath = nil
+        self.accountLimits = accountLimits
+        isFixture = true
+        for state in fixture {
+            if let dispatcher = state.snapshot?.dispatcher { receive(dispatcher, for: state.id) }
+        }
     }
 
     nonisolated static func bundledScript() -> Data? {
@@ -47,9 +84,14 @@ final class FleetStore: ObservableObject {
             .flatMap { try? Data(contentsOf: $0) }
     }
 
+    nonisolated static func bundledDispatcher() -> Data? {
+        Bundle.main.url(forResource: "mm-worker", withExtension: "py")
+            .flatMap { try? Data(contentsOf: $0) }
+    }
+
     func start() {
         users += 1
-        guard users == 1, let script else { return }
+        guard users == 1, !isFixture, let script else { return }
         for state in devices {
             let connection = FleetConnection(device: state.device, script: script)
             let id = state.id
@@ -63,6 +105,7 @@ final class FleetStore: ObservableObject {
                         $0.updatedAt = Date()
                     }
                     self?.settleCancelling(device: id, snapshot: snapshot)
+                    if let dispatcher = snapshot.dispatcher { self?.receive(dispatcher, for: id) }
                 }
             }
             connections[id] = connection
@@ -121,6 +164,128 @@ final class FleetStore: ObservableObject {
         change(&devices[index])
     }
 
+    // MARK: Rules
+
+    /// Rules can be changed only on a reachable machine that has reported them,
+    /// and an account read through someone else's sudo stays read-only.
+    func canEditRules(on state: FleetDeviceState) -> Bool {
+        canCancel(on: state) && state.snapshot?.dispatcher != nil
+    }
+
+    /// Whether this build carries a dispatcher to install at all.
+    var hasDispatcherFile: Bool { dispatcherFile?.isEmpty == false }
+
+    func canInstall(on state: FleetDeviceState) -> Bool {
+        state.isLive && state.device.sudoUser == nil && hasDispatcherFile
+    }
+
+    private func receive(_ dispatcher: FleetDispatcher, for id: String) {
+        if rulesEditors[id] == nil {
+            rulesEditors[id] = FleetRulesEditor(rules: dispatcher.rules, valid: dispatcher.rulesValid)
+        } else {
+            rulesEditors[id]?.receive(rules: dispatcher.rules, valid: dispatcher.rulesValid)
+        }
+    }
+
+    /// Changes the unsaved rules. Ignored once a save is under way or if this
+    /// device can't be edited, so a late click can't alter what is being sent.
+    func editRules(on state: FleetDeviceState, _ change: (inout FleetRules) -> Void) {
+        guard canEditRules(on: state), rulesEditors[state.id]?.isSaving == false else { return }
+        change(&rulesEditors[state.id]!.draft)
+        rulesNotices[state.id] = nil
+    }
+
+    func revertRules(on state: FleetDeviceState) {
+        guard rulesEditors[state.id]?.isSaving == false else { return }
+        rulesEditors[state.id]?.revert()
+        rulesNotices[state.id] = nil
+    }
+
+    func saveRules(on state: FleetDeviceState) {
+        guard canEditRules(on: state), let script, case .live(let alias) = state.link,
+              rulesEditors[state.id]?.canSave == true,
+              let submitted = rulesEditors[state.id]?.beginSave()
+        else { return }
+        let id = state.id, device = state.device
+        rulesNotices[id] = nil
+        Task {
+            let answer = await FleetConnection.setRules(submitted, expectedRevision: submitted.revision,
+                                                        on: device, alias: alias, script: script)
+            switch answer {
+            case .saved(let revision):
+                rulesEditors[id]?.saved(submitted, revision: revision)
+                rulesNotices[id] = .saved
+            default:
+                settle(answer, for: id)
+            }
+        }
+    }
+
+    /// Writes the defaults, dropping any unsaved edits. The view asks first.
+    func resetRules(on state: FleetDeviceState) {
+        guard canEditRules(on: state), let script, case .live(let alias) = state.link,
+              let editor = rulesEditors[state.id], !editor.isSaving
+        else { return }
+        let id = state.id, device = state.device
+        rulesEditors[id]?.isSaving = true
+        rulesNotices[id] = nil
+        Task {
+            let answer = await FleetConnection.resetRules(expectedRevision: editor.expectedRevision,
+                                                          on: device, alias: alias, script: script)
+            switch answer {
+            case .saved(let revision):
+                rulesEditors[id]?.wasReset(revision: revision)
+                rulesNotices[id] = .saved
+            default:
+                settle(answer, for: id)
+            }
+        }
+    }
+
+    private func settle(_ answer: FleetRulesAnswer, for id: String) {
+        switch answer {
+        case .conflict(let revision):
+            rulesEditors[id]?.conflicted(fileRevision: revision)
+            rulesNotices[id] = .conflict
+        case .failed(let failure):
+            rulesEditors[id]?.isSaving = false
+            rulesNotices[id] = .saveFailed(failure)
+        case .saved:
+            break
+        }
+    }
+
+    /// Replaces the machine's `mm-worker`. The view asks first. Only a clean exit
+    /// counts as installed; the next report shows the version it found.
+    func installDispatcher(on state: FleetDeviceState) {
+        guard canInstall(on: state), let dispatcherFile, case .live(let alias) = state.link,
+              !installing.contains(state.id)
+        else { return }
+        let id = state.id, device = state.device
+        installing.insert(id)
+        rulesNotices[id] = nil
+        Task {
+            let failure = await FleetConnection.install(dispatcherFile, on: device, alias: alias)
+            installing.remove(id)
+            rulesNotices[id] = failure.map(FleetRulesNotice.installFailed) ?? .installed
+        }
+    }
+
+    // MARK: Account limits
+
+    func setAccountLimit(_ limit: Int?, provider: String) {
+        guard accountLimits[provider] != limit else { return }
+        if let configPath {
+            do {
+                try FleetConfig.setAccountLimit(limit, provider: provider, at: configPath)
+            } catch {
+                accountLimitFailed = true
+                return
+            }
+        }
+        accountLimits[provider] = limit
+    }
+
     // MARK: Totals
 
     var liveCount: Int { devices.filter(\.isLive).count }
@@ -130,5 +295,8 @@ final class FleetStore: ObservableObject {
     }
     var runningWorkerCount: Int {
         devices.reduce(0) { $0 + ($1.snapshot?.runningWorkers.count ?? 0) }
+    }
+    var providerTotals: [FleetProviderTotal] {
+        FleetProviderTotal.compute(devices: devices, limits: accountLimits)
     }
 }

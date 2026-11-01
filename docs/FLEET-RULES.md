@@ -118,10 +118,11 @@ New commands. Each prints one JSON line and exits 0, including on refusal:
   script. Base64 keeps them out of shell quoting.
 - `rules-reset <expected-revision>`: write the defaults the same way.
 
-Installing is not an agent command, because stdin is taken. The app runs
-`mkdir -p ~/.local/bin && cat > ~/.local/bin/.mm-worker.tmp && chmod 755 ~/.local/bin/.mm-worker.tmp && mv ~/.local/bin/.mm-worker.tmp ~/.local/bin/mm-worker`
-over ssh with the bundled file on stdin. The rename means a running dispatcher
-keeps its old file.
+Installing is not an agent command, because stdin is taken. The app sends the
+bundled file over ssh to a temp file in `~/.local/bin`, checks its byte count,
+and only then renames it to `mm-worker`. A dropped connection can look like a
+normal end of input, so without the check half a file could be installed. The
+rename means a running dispatcher keeps its old file.
 
 ## `~/.cache/mm-worker/` layout
 
