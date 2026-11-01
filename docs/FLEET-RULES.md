@@ -49,7 +49,9 @@ test keeps them equal.
 - `balance`: `proportional` picks the provider with the lowest `used / slots`.
   `priority` takes the first in `order` with a free slot. Ties in `proportional`
   also follow `order`.
-- `order`: exactly the providers in `providers`, each once, in preference order.
+- `order`: preference order. Every enabled provider must appear, once. A disabled
+  provider may appear or not, which is why the defaults can leave out `qwen`.
+  Nothing outside `providers` may appear.
 - `providers.<p>.enabled`: a disabled provider gets no automatic work. `-b <p>`
   still reaches it, as a deliberate override.
 - `providers.<p>.slots`: an integer from 1 to 32.
