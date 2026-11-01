@@ -74,6 +74,23 @@ The SwiftUI settings window, the sixteen-language string table, the "what's new"
 sheet, and the agent process itself: `AppDelegate`, the optional status item,
 and the Sparkle updater.
 
+### `Sources/Fleet/` — other machines
+
+The Fleet window watches agents on several machines and edits each one's
+dispatch rules. Machines are listed in `~/.config/toknotch/fleet.json`, outside
+the repo.
+
+`fleet-agent.py` is piped to `python3` over ssh on each connection, so nothing
+needs installing to be watched, and it exits when the connection ends.
+`FleetConnection` keeps it running, `FleetStore` publishes what it reports, and
+connections run only while the window is open. `mm-worker.py` is the dispatcher
+each machine runs, installed from the app.
+
+[`FLEET-RULES.md`](FLEET-RULES.md) is the contract between the three.
+
+`Tests/fleet_agent_test.py` and `Tests/mm_worker_test.py` run on their own with
+`python3`. The remote tests need `setsid`, so they only run on Linux.
+
 ## Testing
 
 `Tests/` mirrors `Sources/` by concern rather than by file. Layout and render
