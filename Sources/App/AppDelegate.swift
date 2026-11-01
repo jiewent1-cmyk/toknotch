@@ -49,7 +49,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // puts it back below.
         NSApp.setActivationPolicy(.accessory)
         guard !isRunningTests else { return }
-        Telemetry.start()
 
         let coordinator = NotchCoordinator()
 
