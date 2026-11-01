@@ -8,16 +8,21 @@ by itself once the ssh connection goes away, because its next write fails.
 `watch` and `--once` are read-only. They report token counts, model names, tool
 names, the file name a worker last touched and a short title per session or
 worker. They never report message bodies, commands or other tool inputs, or
-anything from credential files.
+anything from credential files: those are read only to tell whether a key is set.
 
 `cancel RUN_ID` stops one running mm-worker task and prints one JSON line.
+
+`rules-set BASE64 REVISION` and `rules-reset REVISION` change this machine's
+dispatch rules (see docs/FLEET-RULES.md) and print one JSON line.
 
 Standard library only, Python 3.9 or newer.
 
 Output is one JSON object per line. `--once` prints a single snapshot.
 """
 
+import base64
 import ctypes
+import fcntl
 import glob
 import json
 import os
@@ -30,11 +35,15 @@ import subprocess
 import sys
 import time
 
-AGENT_VERSION = 3
+AGENT_VERSION = 4
 SCAN_INTERVAL = 2.0  # how often known session files are checked for growth
 WALK_INTERVAL = 15.0  # how often the tree is walked for new session files
 HEARTBEAT = 5.0  # longest gap between snapshots, so CPU and temperature stay current
 TEMPERATURE_INTERVAL = 10.0  # temperature changes slowly and costs more to read
+DISPATCHER_INTERVAL = 10.0  # rules, keys and the installed dispatcher change rarely
+SLOT_GRACE = 5.0  # mm-worker gives a new slot this long to get its pid
+LOCK_TIMEOUT = 10.0  # longest wait for another rules writer to finish
+RULES_LIMIT = 1 << 16  # real rules are well under 2 KB
 SESSION_WINDOW = 6 * 3600  # sessions quieter than this are left out of the list
 MAX_SESSIONS = 60
 FINISHED_JOB_WINDOW = 3600  # how long a finished worker stays listed
@@ -53,6 +62,42 @@ LINUX_CPU_LABELS = ("tctl", "tdie", "package id 0")
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(HOME, ".claude", "projects")
 WORKER_STATE = os.path.join(HOME, ".cache", "mm-worker")
+DISPATCHER = os.path.join(HOME, ".local", "bin", "mm-worker")
+RULES_DIR = os.path.join(HOME, ".config", "mm-worker")
+RULES_PATH = os.path.join(RULES_DIR, "rules.json")
+RULES_LOCK = os.path.join(RULES_DIR, ".rules.lock")
+# ssh without a login shell has a thin PATH, so these are checked as well.
+CLAUDE_DIRS = (os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
+
+PROVIDERS = ("minimax", "zhipu", "claude", "qwen")
+API_KEYS = {"minimax": "MINIMAX_API_KEY", "zhipu": "ZHIPU_API_KEY", "qwen": "QWEN_API_KEY"}
+MODELS = {
+    "minimax": ("m3", "m27", "fast"),
+    "zhipu": ("flash",),
+    "claude": ("sonnet", "haiku", "claude-opus-5-5"),
+    "qwen": ("glm", "max", "flash", "lite", "ds"),
+}
+LEVELS = ("simple", "normal", "hard")
+
+# Kept equal to the copy in mm-worker.py and to docs/FLEET-RULES.md.
+DEFAULT_RULES = {
+    "version": 1,
+    "revision": 0,
+    "balance": "proportional",
+    "order": ["minimax", "zhipu", "claude"],
+    "providers": {
+        "minimax": {"enabled": True, "slots": 8},
+        "zhipu": {"enabled": True, "slots": 4},
+        "claude": {"enabled": True, "slots": 4},
+        "qwen": {"enabled": False, "slots": 4},
+    },
+    "levels": {
+        "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet"},
+        "normal": {"minimax": "m3", "zhipu": "flash", "claude": "sonnet"},
+        "hard": {"claude": "claude-opus-5-5"},
+    },
+    "defaults": {"timeoutSeconds": 900, "cooldownSeconds": 1800},
+}
 
 
 def local_midnight(now):
@@ -285,6 +330,8 @@ def _alive(pid_text):
         pid = int((pid_text or "").strip())
     except ValueError:
         return False
+    if pid <= 0:
+        return False  # kill(0) and kill(-n) reach whole process groups
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -605,6 +652,375 @@ def cancel(run_id):
     return _cancel_remote_job(folders[0]) if folders else _cancel_local_worker(run_id)
 
 
+def _whole(value):
+    # True and False are ints in Python, but not in the rules.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _quote(name):
+    return json.dumps(name[:40])
+
+
+def _key_error(entry, field, expected):
+    unknown = sorted(set(entry) - set(expected))
+    if unknown:
+        return "unknown key %s in %s" % (_quote(unknown[0]), field)
+    for key in expected:
+        if key not in entry:
+            return "%s is missing from %s" % (key, field)
+    return None
+
+
+def rules_error(rules):
+    """What is wrong with these rules, in plain English, or None.
+
+    Messages name the field but never repeat its value, in case somebody
+    pasted a key where a model name belongs.
+    """
+    if not isinstance(rules, dict):
+        return "the rules must be a JSON object"
+    error = _key_error(rules, "the rules", ("version", "revision", "balance", "order", "providers", "levels", "defaults"))
+    if error:
+        return error
+    if not _whole(rules["version"]) or rules["version"] != 1:
+        return "version must be 1"
+    if not _whole(rules["revision"]) or rules["revision"] < 0:
+        return "revision must be a whole number, 0 or more"
+    if rules["balance"] not in ("proportional", "priority"):
+        return 'balance must be "proportional" or "priority"'
+    providers = rules["providers"]
+    if not isinstance(providers, dict) or not providers:
+        return "providers must be an object naming at least one provider"
+    for name in sorted(providers):
+        field = "providers." + name
+        if name not in MODELS:
+            return "unknown provider %s in providers" % _quote(name)
+        entry = providers[name]
+        if not isinstance(entry, dict):
+            return field + " must be an object"
+        error = _key_error(entry, field, ("enabled", "slots"))
+        if error:
+            return error
+        if not isinstance(entry["enabled"], bool):
+            return field + ".enabled must be true or false"
+        if not _whole(entry["slots"]) or not 1 <= entry["slots"] <= 32:
+            return field + ".slots must be a whole number from 1 to 32"
+    # The defaults leave the disabled qwen out of order, so a disabled provider
+    # may be missing from it. Anything else must match providers exactly.
+    order = rules["order"]
+    enabled = [name for name in providers if providers[name]["enabled"]]
+    if (not isinstance(order, list) or not all(isinstance(name, str) for name in order)
+            or len(set(order)) != len(order) or not set(order) <= set(providers)
+            or not set(enabled) <= set(order)):
+        return "order must list each enabled provider in providers once, and nothing else"
+    levels = rules["levels"]
+    if not isinstance(levels, dict):
+        return "levels must be an object"
+    error = _key_error(levels, "levels", LEVELS)
+    if error:
+        return error
+    for level in LEVELS:
+        field = "levels." + level
+        choice = levels[level]
+        if not isinstance(choice, dict) or not choice:
+            return field + " must name at least one provider"
+        for name in sorted(choice):
+            if name not in providers:
+                return "%s names %s, which is not in providers" % (field, _quote(name))
+            if choice[name] not in MODELS[name]:
+                return "%s.%s must be one of %s" % (field, name, ", ".join(MODELS[name]))
+    defaults = rules["defaults"]
+    if not isinstance(defaults, dict):
+        return "defaults must be an object"
+    error = _key_error(defaults, "defaults", ("timeoutSeconds", "cooldownSeconds"))
+    if error:
+        return error
+    if not _whole(defaults["timeoutSeconds"]) or not 30 <= defaults["timeoutSeconds"] <= 86400:
+        return "defaults.timeoutSeconds must be a whole number from 30 to 86400"
+    if not _whole(defaults["cooldownSeconds"]) or not 0 <= defaults["cooldownSeconds"] <= 86400:
+        return "defaults.cooldownSeconds must be a whole number from 0 to 86400"
+    return None
+
+
+def default_rules(revision=0):
+    rules = json.loads(json.dumps(DEFAULT_RULES))  # a deep copy
+    rules["revision"] = revision
+    return rules
+
+
+def load_rules():
+    """(rules, valid). A missing file means the defaults. So does an unusable
+    one, flagged invalid so the app can offer to repair it."""
+    try:
+        with open(RULES_PATH, "rb") as handle:
+            data = handle.read(RULES_LIMIT + 1)
+    except FileNotFoundError:
+        return default_rules(), True
+    except OSError:
+        return default_rules(), False
+    try:
+        rules = json.loads(data.decode("utf-8")) if len(data) <= RULES_LIMIT else None
+    except (ValueError, RecursionError):
+        rules = None
+    if rules is None or rules_error(rules):
+        return default_rules(), False
+    return rules, True
+
+
+def _shell_word(text):
+    """The value of `KEY=<text>` as a shell would read it, without running it.
+    Expansions like $X stay literal: enough to tell empty from set."""
+    word, quote, index = [], None, 0
+    while index < len(text):
+        char = text[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            else:
+                word.append(char)
+        elif quote == '"':
+            if char == '"':
+                quote = None
+            elif char == "\\" and text[index + 1:index + 2] in ('"', "\\", "$", "`"):
+                index += 1
+                word.append(text[index])
+            else:
+                word.append(char)
+        elif char in "'\"":
+            quote = char
+        elif char == "\\" and index + 1 < len(text):
+            index += 1
+            word.append(text[index])
+        elif char in " \t;&|":
+            break
+        else:
+            word.append(char)
+        index += 1
+    return "" if quote else "".join(word)  # an open quote would fail to source
+
+
+ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+def _key_value(provider):
+    """The provider's API key, or "". Callers only test it or hide it: it is
+    never stored, reported or logged."""
+    variable = API_KEYS.get(provider)
+    text = _read_text(os.path.join(HOME, ".config", provider, "env"), 1 << 16) if variable else None
+    value = ""
+    for line in (text or "").lstrip("\ufeff").splitlines():
+        match = ASSIGNMENT.match(line.strip())
+        if match and match.group(1) == variable:
+            value = _shell_word(match.group(2)).strip()  # the last one wins, as in a shell
+    return value
+
+
+def claude_installed():
+    """Whether a `claude` command exists. It is never run."""
+    for folder in os.environ.get("PATH", "").split(os.pathsep) + list(CLAUDE_DIRS):
+        path = os.path.join(folder, "claude")
+        # A relative PATH entry would depend on where ssh started us.
+        if os.path.isabs(folder) and os.path.isfile(path) and os.access(path, os.X_OK):
+            return True
+    return False
+
+
+VERSION_LINE = re.compile(r"^MM_WORKER_VERSION\s*=\s*([0-9]+)\s*(?:#.*)?$", re.MULTILINE)
+
+
+def dispatcher_version():
+    """(installed, version) from the top of the installed file, without running
+    it. The older shell dispatcher has no version line: version 0."""
+    if not os.path.isfile(DISPATCHER):
+        return False, 0
+    match = VERSION_LINE.search(_read_text(DISPATCHER, 4096) or "")
+    return True, (int(match.group(1)) if match else 0)
+
+
+def used_slots(provider, now):
+    """Live slots, counted the way mm-worker counts them."""
+    root = os.path.join(WORKER_STATE, "slots", provider)
+    try:
+        slots = os.listdir(root)
+    except OSError:
+        return 0
+    used = 0
+    for slot in slots:
+        folder = os.path.join(root, slot)
+        pid = (_read_text(os.path.join(folder, "pid"), 64) or "").strip()
+        if pid.isdigit():
+            used += _alive(pid)
+            continue
+        try:
+            used += now - os.stat(folder).st_mtime < SLOT_GRACE  # still waiting for its pid
+        except OSError:
+            pass
+    return used
+
+
+def _dispatcher_files():
+    """Everything about the dispatcher that only changes when a file does."""
+    installed, version = dispatcher_version()
+    rules, valid = load_rules()
+    claude = claude_installed()
+    providers = {}
+    for provider in PROVIDERS:
+        key = _key_value(provider)
+        try:
+            until = float((_read_text(os.path.join(WORKER_STATE, provider + "_unavailable_until"), 64) or "").strip())
+        except ValueError:
+            until = 0.0
+        reason = " ".join((_read_text(os.path.join(WORKER_STATE, provider + "_unavailable_reason"), 4096) or "").split())
+        if len(key) >= 4:
+            reason = reason.replace(key, "[hidden]")  # a provider's error may quote the key back
+        providers[provider] = {
+            "configured": claude if provider == "claude" else bool(key),
+            "until": until,
+            "reason": reason[:200],
+        }
+    return {"installed": installed, "version": version, "claudeInstalled": claude,
+            "rules": rules, "rulesValid": valid, "providers": providers}
+
+
+class Dispatcher:
+    """mm-worker's state for snapshots. Files are re-read every
+    DISPATCHER_INTERVAL; slots are only a directory listing, so they are counted
+    on every pass."""
+
+    def __init__(self):
+        self.files = None
+        self.files_at = None
+
+    def read(self, now):
+        if self.files_at is None or now - self.files_at >= DISPATCHER_INTERVAL:
+            self.files_at = now
+            self.files = _dispatcher_files()
+        report = {key: value for key, value in self.files.items() if key != "providers"}
+        report["providers"] = {}
+        for provider, state in self.files["providers"].items():
+            cooling = state["until"] > now
+            report["providers"][provider] = {
+                "configured": state["configured"],
+                "used": used_slots(provider, now),
+                "cooling": cooling,
+                "coolingReason": state["reason"] if cooling else "",
+            }
+        return report
+
+
+REVISION = re.compile(r"^[0-9]{1,15}$")
+RULES_USAGE = "usage: rules-set BASE64 REVISION, or rules-reset REVISION"
+
+
+def _why(error):
+    return error.strerror or type(error).__name__
+
+
+def _lock(handle):
+    """Takes the writers' lock, giving up after LOCK_TIMEOUT so a stuck writer
+    can't hang the app's ssh command. Closing the file releases it, even if
+    this process dies."""
+    deadline = time.time() + LOCK_TIMEOUT
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+def _replace(path, text):
+    """Write a whole new file, so mm-worker reads either the old rules or the new."""
+    folder = os.path.dirname(path)
+    temp = os.path.join(folder, ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+    handle = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(handle, 0o600)  # whatever the umask
+        os.write(handle, text.encode("utf-8"))
+        os.fsync(handle)
+        os.close(handle)
+        handle = None
+        os.replace(temp, path)
+    except BaseException:
+        if handle is not None:
+            os.close(handle)
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+    try:
+        handle = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(handle)  # so the rename itself survives a power cut
+        finally:
+            os.close(handle)
+    except OSError:
+        pass
+
+
+def write_rules(rules, expected):
+    """Write rules whose revision is expected + 1, if the file is still at expected."""
+    try:
+        os.makedirs(RULES_DIR, mode=0o700, exist_ok=True)
+        lock = os.open(RULES_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as error:
+        return {"ok": False, "error": "could not open the rules folder: " + _why(error)}
+    try:
+        if not _lock(lock):
+            return {"ok": False, "error": "another change to the rules is still being written"}
+        # An invalid file reads as the defaults, revision 0, as in snapshots.
+        current, valid = load_rules()
+        current = current["revision"] if valid else 0
+        if current != expected:
+            return {"ok": False, "error": "conflict", "revision": current}
+        _replace(RULES_PATH, json.dumps(rules, indent=2) + "\n")
+    except OSError as error:
+        return {"ok": False, "error": "could not write the rules: " + _why(error)}
+    finally:
+        os.close(lock)
+    return {"ok": True, "revision": rules["revision"]}
+
+
+def rules_set(encoded, expected):
+    if not REVISION.match(expected):
+        return {"ok": False, "error": "the expected revision must be a whole number"}
+    try:
+        if len(encoded) > RULES_LIMIT * 2:
+            raise ValueError
+        rules = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
+    except (ValueError, RecursionError):  # bad base64 is a ValueError too
+        return {"ok": False, "error": "the rules are not base64-encoded JSON"}
+    if not isinstance(rules, dict):
+        return {"ok": False, "error": "the rules must be a JSON object"}
+    # The revision is ours to set, so whatever the app sent is replaced.
+    rules["revision"] = int(expected) + 1
+    error = rules_error(rules)
+    if error:
+        return {"ok": False, "error": error}
+    return write_rules(rules, int(expected))
+
+
+def rules_reset(expected):
+    if not REVISION.match(expected):
+        return {"ok": False, "error": "the expected revision must be a whole number"}
+    return write_rules(default_rules(int(expected) + 1), int(expected))
+
+
+def rules_command(argv):
+    """One answer for every input, never a traceback: the app reads one line."""
+    try:
+        if argv[0] == "rules-set" and len(argv) == 3:
+            return rules_set(argv[1], argv[2])
+        if argv[0] == "rules-reset" and len(argv) == 2:
+            return rules_reset(argv[1])
+        return {"ok": False, "error": RULES_USAGE}
+    except Exception as error:  # a bug here must still answer
+        return {"ok": False, "error": "unexpected " + type(error).__name__}
+
+
 def linux_cpu_times():
     """(busy, total) ticks since boot, from the first line of /proc/stat."""
     text = _read_text(PROC_STAT)
@@ -883,7 +1299,7 @@ def host_info():
     }
 
 
-def snapshot(log, now, vitals=None):
+def snapshot(log, now, vitals=None, dispatcher=None):
     sessions, models = log.report(now)
     workers = (local_workers(now, log.streams, log.usage_by_session)
                + remote_jobs(now, log.streams, log.usage_by_session))
@@ -898,12 +1314,16 @@ def snapshot(log, now, vitals=None):
         "sessions": sessions,
         "todayByModel": models,
         "workers": workers,
+        "dispatcher": (dispatcher if dispatcher is not None else Dispatcher()).read(now),
     }
 
 
 def main(argv):
     if argv[:1] == ["cancel"]:
         print(json.dumps(cancel(argv[1] if len(argv) > 1 else "")))
+        return 0
+    if argv[:1] in (["rules-set"], ["rules-reset"]):
+        print(json.dumps(rules_command(argv)))
         return 0
     if hasattr(os, "nice"):
         try:
@@ -912,6 +1332,7 @@ def main(argv):
             pass
     log = SessionLog()
     vitals = Vitals()
+    dispatcher = Dispatcher()
     time.sleep(0.25)  # so the first CPU reading has an interval to measure
     once = "--once" in argv
     last_body = None
@@ -919,7 +1340,7 @@ def main(argv):
     while True:
         now = time.time()
         log.scan(now)
-        report = snapshot(log, now, vitals)
+        report = snapshot(log, now, vitals, dispatcher)
         # Ages and machine load change on every pass, so they don't count as news.
         body = json.dumps(_without_clock(report), sort_keys=True)
         if once or body != last_body or now - last_sent >= HEARTBEAT:
@@ -939,6 +1360,12 @@ def _without_clock(report):
     stable["host"] = {k: v for k, v in report["host"].items() if k not in ("load", "cpuPercent", "temperature")}
     stable["sessions"] = [{k: v for k, v in s.items() if k != "idleSeconds"} for s in report["sessions"]]
     stable["workers"] = [{k: v for k, v in w.items() if k not in ("elapsedSeconds", "idleSeconds")} for w in report["workers"]]
+    # A slot comes and goes with its worker, which is news already. Leaving
+    # `used` out means a slot still waiting for its pid waits for the heartbeat.
+    dispatcher = dict(report["dispatcher"])
+    dispatcher["providers"] = {name: {k: v for k, v in p.items() if k != "used"}
+                               for name, p in report["dispatcher"]["providers"].items()}
+    stable["dispatcher"] = dispatcher
     return stable
 
 
