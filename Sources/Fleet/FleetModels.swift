@@ -29,7 +29,14 @@ struct FleetSnapshot: Decodable, Equatable {
         workers.filter { $0.state == .running && $0.remoteHost == nil }
     }
 
-    var activeSessions: [FleetSession] { sessions.filter(\.isActive) }
+    /// Sessions that are not simply a worker listed above, which would show the
+    /// same task twice.
+    var ownSessions: [FleetSession] {
+        let workerSessions = Set(workers.compactMap(\.sessionId))
+        return sessions.filter { !workerSessions.contains($0.id) }
+    }
+
+    var activeSessions: [FleetSession] { ownSessions.filter(\.isActive) }
 }
 
 /// How worrying a CPU or temperature reading is.
@@ -88,6 +95,21 @@ struct FleetWorker: Decodable, Equatable, Identifiable {
     var usage: FleetUsage?
     /// Set on the dispatching machine when the worker runs on another one.
     var remoteHost: String?
+    /// Progress, from the worker's event stream. Absent on a worker started
+    /// before streams, or one that has not said anything yet.
+    var steps: Int?
+    var lastTool: String?
+    var lastFile: String?
+    var model: String?
+    var sessionId: String?
+    var idleSeconds: Int?
+
+    /// Long enough to mention, though a long-running command looks just like this.
+    static let quietAfter = 300
+
+    var isQuiet: Bool { state == .running && (idleSeconds ?? 0) >= Self.quietAfter }
+    /// Only the machine running it can stop it; a dispatcher finds out from there.
+    var isCancellableHere: Bool { state == .running && remoteHost == nil }
 }
 
 /// A machine or account to watch, from `~/.config/toknotch/fleet.json`.

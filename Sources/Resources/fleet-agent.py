@@ -5,9 +5,12 @@ TokNotch pipes this file into `python3 -I -u - watch` over ssh, so nothing is
 installed on the remote machine and the agent always matches the app. It ends
 by itself once the ssh connection goes away, because its next write fails.
 
-It is read-only. It reports token counts, model names, tool names and a short
-title per session or worker. It never reports message bodies, tool inputs or
+`watch` and `--once` are read-only. They report token counts, model names, tool
+names, the file name a worker last touched and a short title per session or
+worker. They never report message bodies, commands or other tool inputs, or
 anything from credential files.
+
+`cancel RUN_ID` stops one running mm-worker task and prints one JSON line.
 
 Standard library only, Python 3.9 or newer.
 
@@ -23,10 +26,11 @@ import re
 import select
 import signal
 import socket
+import subprocess
 import sys
 import time
 
-AGENT_VERSION = 2
+AGENT_VERSION = 3
 SCAN_INTERVAL = 2.0  # how often known session files are checked for growth
 WALK_INTERVAL = 15.0  # how often the tree is walked for new session files
 HEARTBEAT = 5.0  # longest gap between snapshots, so CPU and temperature stay current
@@ -101,6 +105,8 @@ class SessionLog:
         # message id, keeping the latest usage seen.
         self.messages = {}  # message id -> record
         self.sessions = {}  # session id -> metadata
+        self.usage_by_session = {}  # filled by report()
+        self.streams = WorkerStreams()
         self.last_walk = 0.0
 
     def walk(self, midnight):
@@ -241,6 +247,7 @@ class SessionLog:
                 "idleSeconds": max(0, int(now - activity)),
                 "usage": by_session[ident],
             })
+        self.usage_by_session = by_session
         listed.sort(key=lambda item: item["idleSeconds"])
         return listed[:MAX_SESSIONS], by_model
 
@@ -288,24 +295,120 @@ def _alive(pid_text):
 
 
 def _worker_result(path):
-    """Tokens from a finished worker's final JSON line. Never its result text."""
+    """(tokens, session id) from a finished worker's final line. Never its result text."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as handle:
             handle.seek(max(0, size - (1 << 20)))
             lines = handle.read().splitlines()
-        usage = json.loads(lines[-1]).get("usage") or {}
+        result = json.loads(lines[-1])
+        usage = result.get("usage") or {}
     except (OSError, ValueError, IndexError, AttributeError):
-        return None
+        return None, None
     return {
         "input": _count(usage, "input_tokens"),
         "output": _count(usage, "output_tokens"),
         "cacheRead": _count(usage, "cache_read_input_tokens"),
         "cacheWrite": _count(usage, "cache_creation_input_tokens"),
-    }
+    }, result.get("session_id")
 
 
-def remote_jobs(now):
+class WorkerStreams:
+    """Follows the event stream of each running worker.
+
+    A stream's own usage figures are placeholders until the final result, so
+    tokens come from the session log through the session id found here.
+    """
+
+    def __init__(self):
+        self.states = {}
+
+    def progress(self, path, now):
+        """What a worker is doing, from its stream file. Empty if there is none."""
+        state = self.states.setdefault(path, {"offset": 0, "messages": set(), "pending": b""})
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return {}
+        if stat.st_size < state["offset"]:
+            state.update(offset=0, pending=b"", messages=set())
+        if stat.st_size > state["offset"]:
+            self._read(path, state)
+        report = {"idleSeconds": max(0, int(now - stat.st_mtime))}
+        if state["messages"]:
+            report["steps"] = len(state["messages"])
+        for key in ("sessionId", "model", "lastTool", "lastFile"):
+            if state.get(key):
+                report[key] = state[key]
+        return report
+
+    def forget_except(self, paths):
+        for path in list(self.states):
+            if path not in paths:
+                del self.states[path]
+
+    def _read(self, path, state):
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(state["offset"])
+                while True:
+                    chunk = handle.read(READ_CHUNK)
+                    if not chunk:
+                        return
+                    state["offset"] += len(chunk)
+                    lines = (state["pending"] + chunk).split(b"\n")
+                    state["pending"] = lines.pop()
+                    for line in lines:
+                        self._line(line, state)
+        except OSError:
+            pass
+
+    def _line(self, line, state):
+        # Tool results make up most of a stream, and they can be huge.
+        if b'"assistant"' not in line[:200] and b'"init"' not in line[:200]:
+            return
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(event, dict):
+            return
+        if event.get("session_id"):
+            state["sessionId"] = event["session_id"]
+        if event.get("type") == "system" and event.get("model"):
+            state["model"] = event["model"]
+        if event.get("type") != "assistant":
+            return
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return
+        if message.get("id"):
+            state["messages"].add(message["id"])
+        if message.get("model") and message["model"] != "<synthetic>":
+            state["model"] = message["model"]
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
+                state["lastTool"] = block["name"]
+                target = (block.get("input") or {}).get("file_path")
+                # The name only: enough to see what it is working on.
+                state["lastFile"] = os.path.basename(target) if isinstance(target, str) else ""
+
+
+def _add_progress(worker, stream, streams, usage_by_session, now):
+    if streams is None:
+        return
+    worker.update(streams.progress(stream, now))
+    usage = usage_by_session.get(worker.get("sessionId"))
+    if usage:
+        worker["usage"] = usage
+
+
+def _task_title(name_path, prompt_path):
+    """The name given with -n, or failing that a guess from the prompt."""
+    return tidy_title(_read_text(name_path, 512)) or tidy_title(_read_text(prompt_path))
+
+
+def remote_jobs(now, streams=None, usage_by_session=None):
     """Workers this machine runs for a dispatcher elsewhere (mm-remote-run)."""
     root = os.path.join(WORKER_STATE, "jobs")
     try:
@@ -340,13 +443,19 @@ def remote_jobs(now):
             "id": run_id or name,
             "provider": provider,
             "state": state,
-            "title": tidy_title(_read_text(os.path.join(folder, "prompt.md"))),
+            "title": _task_title(os.path.join(folder, "name"), os.path.join(folder, "prompt.md")),
             "elapsedSeconds": int((finished or now) - started),
         }
         if finished is not None:
-            usage = _worker_result(os.path.join(folder, "out.json"))
+            usage, session = _worker_result(os.path.join(folder, "out.json"))
             if usage:
                 job["usage"] = usage
+            if session:
+                job["sessionId"] = session
+        elif state == "running":
+            stream = os.path.join(folder, "out.json")
+            _add_progress(job, stream, streams, usage_by_session or {}, now)
+            job["stream"] = stream  # only so snapshot() knows what is still live
         jobs.append(job)
     return jobs
 
@@ -361,7 +470,7 @@ def _finished_state(code):
     return "failed"
 
 
-def local_workers(now):
+def local_workers(now, streams=None, usage_by_session=None):
     """Workers mm-worker holds a slot for on this machine, and any it sent away."""
     root = os.path.join(WORKER_STATE, "slots")
     runs = os.path.join(WORKER_STATE, "runs")
@@ -389,12 +498,17 @@ def local_workers(now):
                 "id": run_id or pid,
                 "provider": provider,
                 "state": "running",
-                "title": tidy_title(_read_text(os.path.join(runs, str(run_id) + ".prompt.md"))),
+                "title": _task_title(os.path.join(runs, str(run_id) + ".name"),
+                                     os.path.join(runs, str(run_id) + ".prompt.md")),
                 "elapsedSeconds": int(now - started),
             }
             remote = _read_text(os.path.join(runs, str(run_id) + ".remote")) if run_id else None
             if remote and remote.split():
                 worker["remoteHost"] = remote.split()[0]
+            elif run_id:
+                stream = os.path.join(runs, "%s.%s.json" % (run_id, provider))
+                _add_progress(worker, stream, streams, usage_by_session or {}, now)
+                worker["stream"] = stream
             workers.append(worker)
     return workers
 
@@ -407,6 +521,88 @@ def _run_id_for(runs, pid):
     except OSError:
         return None
     return max(matches)[: -len(".prompt.md")] if matches else None
+
+
+RUN_ID = re.compile(r"^[0-9]+-[0-9]+-[0-9]+$")
+
+
+def _descendants(pid):
+    """Every process below pid, children first found first."""
+    found, queue = [], [str(pid)]
+    while queue:
+        parent = queue.pop()
+        try:
+            output = subprocess.run(["pgrep", "-P", parent], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        children = output.decode().split()
+        found.extend(children)
+        queue.extend(children)
+    return found
+
+
+def _signal(pid):
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+
+
+def _cancel_remote_job(folder):
+    """A job started by mm-remote-run. Writing rc first tells the dispatcher that
+    this was a cancellation, so it does not hand the task to another provider."""
+    pid = (_read_text(os.path.join(folder, "pid")) or "").strip()
+    if not pid.isdigit() or not _alive(pid):
+        return {"ok": False, "error": "not running"}
+    try:
+        with open(os.path.join(folder, "rc"), "x") as handle:
+            handle.write("cancelled\n")
+    except FileExistsError:
+        return {"ok": False, "error": "already finished"}
+    except OSError as error:
+        return {"ok": False, "error": str(error)}
+    # `timeout` in mm-remote-run moves into its own process group, so this goes
+    # by session: the job was started with setsid.
+    subprocess.run(["pkill", "-TERM", "-s", pid], stderr=subprocess.DEVNULL, timeout=10)
+    try:
+        open(os.path.join(folder, "out.json"), "w").close()  # the stream can be large
+    except OSError:
+        pass
+    return {"ok": True}
+
+
+def _cancel_local_worker(run_id):
+    """A worker running under mm-worker on this machine."""
+    runs = os.path.join(WORKER_STATE, "runs")
+    pid = run_id.rsplit("-", 1)[1]
+    slots = glob.glob(os.path.join(WORKER_STATE, "slots", "*", "*", "pid"))
+    if not any((_read_text(path) or "").strip() == pid for path in slots) or not _alive(pid):
+        return {"ok": False, "error": "not running"}
+    if os.path.exists(os.path.join(runs, run_id + ".remote")):
+        return {"ok": False, "error": "runs on another machine"}
+    try:
+        command = subprocess.run(["ps", "-o", "command=", "-p", pid], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, timeout=5).stdout.decode()
+    except (OSError, subprocess.SubprocessError):
+        command = ""
+    if "mm-worker" not in command:  # a recycled pid is somebody else's process
+        return {"ok": False, "error": "not a worker"}
+    # The marker first: killing the model makes the run look like a provider
+    # failure, and mm-worker would otherwise retry it elsewhere.
+    open(os.path.join(runs, run_id + ".cancelled"), "w").close()
+    below = _descendants(pid)
+    _signal(pid)
+    for child in below:
+        _signal(child)
+    return {"ok": True}
+
+
+def cancel(run_id):
+    if not RUN_ID.match(run_id or ""):
+        return {"ok": False, "error": "bad run id"}
+    folders = glob.glob(os.path.join(WORKER_STATE, "jobs", run_id + "-*"))
+    return _cancel_remote_job(folders[0]) if folders else _cancel_local_worker(run_id)
 
 
 def linux_cpu_times():
@@ -689,6 +885,10 @@ def host_info():
 
 def snapshot(log, now, vitals=None):
     sessions, models = log.report(now)
+    workers = (local_workers(now, log.streams, log.usage_by_session)
+               + remote_jobs(now, log.streams, log.usage_by_session))
+    live = {worker.pop("stream") for worker in workers if "stream" in worker}
+    log.streams.forget_except(live)
     host = host_info()
     if vitals is not None:
         host.update(vitals.read(now))
@@ -697,11 +897,14 @@ def snapshot(log, now, vitals=None):
         "host": host,
         "sessions": sessions,
         "todayByModel": models,
-        "workers": local_workers(now) + remote_jobs(now),
+        "workers": workers,
     }
 
 
 def main(argv):
+    if argv[:1] == ["cancel"]:
+        print(json.dumps(cancel(argv[1] if len(argv) > 1 else "")))
+        return 0
     if hasattr(os, "nice"):
         try:
             os.nice(10)  # this should never be what a machine is busy doing
@@ -735,7 +938,7 @@ def _without_clock(report):
     stable = dict(report)
     stable["host"] = {k: v for k, v in report["host"].items() if k not in ("load", "cpuPercent", "temperature")}
     stable["sessions"] = [{k: v for k, v in s.items() if k != "idleSeconds"} for s in report["sessions"]]
-    stable["workers"] = [{k: v for k, v in w.items() if k != "elapsedSeconds"} for w in report["workers"]]
+    stable["workers"] = [{k: v for k, v in w.items() if k not in ("elapsedSeconds", "idleSeconds")} for w in report["workers"]]
     return stable
 
 

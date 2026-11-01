@@ -59,11 +59,13 @@ final class FleetConnection: @unchecked Sendable {
     }
 
     /// The command that runs the agent. Pure, so it can be tested.
-    static func command(for device: FleetDevice, alias: String?) -> (path: String, arguments: [String]) {
+    static func command(for device: FleetDevice, alias: String?,
+                        action: [String] = ["watch"]) -> (path: String, arguments: [String]) {
         guard let alias else {
-            return ("/usr/bin/env", ["python3", "-I", "-u", "-", "watch"])
+            return ("/usr/bin/env", ["python3", "-I", "-u", "-"] + action)
         }
-        var remote = "python3 -I -u - watch"
+        var remote = (["python3 -I -u -"] + action.map { $0 == "watch" ? $0 : shellQuote($0) })
+            .joined(separator: " ")
         if let user = device.sudoUser {
             remote = "sudo -n -u \(shellQuote(user)) -H \(remote)"
         }
@@ -79,6 +81,57 @@ final class FleetConnection: @unchecked Sendable {
 
     static func shellQuote(_ text: String) -> String {
         "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// A run id as mm-worker writes it. Anything else never reaches a shell.
+    static func isRunID(_ text: String) -> Bool {
+        text.range(of: "^[0-9]+-[0-9]+-[0-9]+$", options: .regularExpression) != nil
+    }
+
+    /// What the agent answered, or why it could not be asked.
+    static func cancelError(fromOutput output: Data) -> String? {
+        struct Answer: Decodable { var ok: Bool; var error: String? }
+        guard let line = String(decoding: output, as: UTF8.self)
+                .split(whereSeparator: \.isNewline).last,
+              let answer = try? JSONDecoder().decode(Answer.self, from: Data(line.utf8))
+        else { return "No answer from the machine" }
+        return answer.ok ? nil : (answer.error ?? "Failed")
+    }
+
+    /// Asks the machine to stop one worker. Nil means it did.
+    static func cancel(runID: String, on device: FleetDevice, alias: String?,
+                       script: Data) async -> String? {
+        guard isRunID(runID) else { return "Bad run id" }
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let (path, arguments) = command(for: device, alias: alias, action: ["cancel", runID])
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: path)
+                process.arguments = arguments
+                var environment = ProcessInfo.processInfo.environment
+                environment["HOME"] = NSHomeDirectory()
+                environment["PATH"] = TokscaleCLI.searchPath
+                process.environment = environment
+                let input = Pipe(), output = Pipe()
+                process.standardInput = input
+                process.standardOutput = output
+                process.standardError = FileHandle.nullDevice
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(returning: error.localizedDescription)
+                    return
+                }
+                try? input.fileHandleForWriting.write(contentsOf: script)
+                try? input.fileHandleForWriting.close()
+                let limit = DispatchWorkItem { process.terminate() }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: limit)
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                limit.cancel()
+                continuation.resume(returning: cancelError(fromOutput: data))
+            }
+        }
     }
 
     /// Doubling from 5 seconds, capped at a minute.

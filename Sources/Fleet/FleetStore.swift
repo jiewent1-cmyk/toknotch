@@ -21,6 +21,10 @@ struct FleetDeviceState: Identifiable, Equatable {
 @MainActor
 final class FleetStore: ObservableObject {
     @Published private(set) var devices: [FleetDeviceState]
+    /// Workers asked to stop that still report as running, as "device/run".
+    @Published private(set) var cancelling: Set<String> = []
+    /// Why the last cancellation failed, until somebody has read it.
+    @Published var cancelError: String?
     private var connections: [String: FleetConnection] = [:]
     private var users = 0
     private let script: Data?
@@ -58,6 +62,7 @@ final class FleetStore: ObservableObject {
                         $0.snapshot = snapshot
                         $0.updatedAt = Date()
                     }
+                    self?.settleCancelling(device: id, snapshot: snapshot)
                 }
             }
             connections[id] = connection
@@ -70,6 +75,45 @@ final class FleetStore: ObservableObject {
         guard users == 0 else { return }
         connections.values.forEach { $0.stop() }
         connections.removeAll()
+    }
+
+    // MARK: Cancelling
+
+    static func cancelKey(device: String, worker: String) -> String { "\(device)/\(worker)" }
+
+    /// Whether this device's workers can be stopped from here: it has to be
+    /// reachable, and an account read through someone else's sudo stays read-only.
+    func canCancel(on state: FleetDeviceState) -> Bool {
+        state.isLive && state.device.sudoUser == nil && script != nil
+    }
+
+    func cancel(_ worker: FleetWorker, on state: FleetDeviceState) {
+        guard canCancel(on: state), worker.isCancellableHere, let script,
+              case .live(let alias) = state.link
+        else { return }
+        let key = Self.cancelKey(device: state.id, worker: worker.id)
+        cancelling.insert(key)
+        let device = state.device
+        Task {
+            let failure = await FleetConnection.cancel(runID: worker.id, on: device,
+                                                       alias: alias, script: script)
+            if let failure {
+                cancelling.remove(key)
+                cancelError = failure
+            }
+        }
+    }
+
+    /// The agent reporting it as no longer running is what ends "cancelling".
+    private func settleCancelling(device: String, snapshot: FleetSnapshot) {
+        guard !cancelling.isEmpty else { return }
+        let prefix = device + "/"
+        let running = Set(snapshot.workers.filter { $0.state == .running }.map {
+            Self.cancelKey(device: device, worker: $0.id)
+        })
+        for key in cancelling where key.hasPrefix(prefix) && !running.contains(key) {
+            cancelling.remove(key)
+        }
     }
 
     private func update(_ id: String, _ change: (inout FleetDeviceState) -> Void) {

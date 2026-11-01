@@ -9,10 +9,48 @@ final class FleetTests: XCTestCase {
     {"id":"b","title":"","kind":"worker","model":"m","cwd":"","lastTool":"","idleSeconds":500,
     "usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}],
     "todayByModel":{"m":{"input":1,"output":2,"cacheRead":3,"cacheWrite":4},"n":{"input":10,"output":0,"cacheRead":0,"cacheWrite":0}},
-    "workers":[{"id":"1","provider":"minimax","state":"running","title":"x","elapsedSeconds":3},
+    "workers":[{"id":"1","provider":"minimax","state":"running","title":"x","elapsedSeconds":3,"steps":6,"lastTool":"Edit","lastFile":"foo.swift","model":"m","sessionId":"b","idleSeconds":400},
     {"id":"2","provider":"claude","state":"running","title":"y","elapsedSeconds":3,"remoteHost":"other-box"},
     {"id":"3","provider":"zhipu","state":"done","title":"z","elapsedSeconds":3,"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0}}]}
     """.replacingOccurrences(of: "\n", with: "")
+
+    func testAWorkersSessionIsNotListedOrCountedTwice() throws {
+        let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: Data(sample.utf8)))
+        XCTAssertEqual(snapshot.sessions.map(\.id), ["a", "b"])
+        XCTAssertEqual(snapshot.ownSessions.map(\.id), ["a"])
+    }
+
+    func testWorkerProgress() throws {
+        let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: Data(sample.utf8)))
+        let worker = try XCTUnwrap(snapshot.workers.first { $0.id == "1" })
+        XCTAssertEqual(worker.steps, 6)
+        XCTAssertEqual(worker.lastFile, "foo.swift")
+        XCTAssertTrue(worker.isQuiet)
+        XCTAssertTrue(worker.isCancellableHere)
+    }
+
+    /// One sent elsewhere is stopped on the machine running it; finished ones are done.
+    func testOnlyRunningLocalWorkersCanBeCancelledHere() throws {
+        let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: Data(sample.utf8)))
+        XCTAssertEqual(snapshot.workers.filter(\.isCancellableHere).map(\.id), ["1"])
+    }
+
+    func testOnlyRealRunIDsAreAccepted() {
+        XCTAssertTrue(FleetConnection.isRunID("20261101-012605-1064"))
+        for bad in ["", "1-2", "1-2-3; rm -rf ~", "../x", "1-2-3\n", "$(id)-1-2"] {
+            XCTAssertFalse(FleetConnection.isRunID(bad), bad)
+        }
+    }
+
+    func testCancelCommandAndAnswers() {
+        let device = FleetDevice(id: "p", label: "p", ssh: ["box"])
+        XCTAssertEqual(FleetConnection.command(for: device, alias: "box", action: ["cancel", "1-2-3"]).arguments.last,
+                       "python3 -I -u - 'cancel' '1-2-3'")
+        XCTAssertNil(FleetConnection.cancelError(fromOutput: Data("noise\n{\"ok\": true}\n".utf8)))
+        XCTAssertEqual(FleetConnection.cancelError(fromOutput: Data("{\"ok\": false, \"error\": \"not running\"}".utf8)),
+                       "not running")
+        XCTAssertNotNil(FleetConnection.cancelError(fromOutput: Data()))
+    }
 
     func testDecodesAgentLine() throws {
         let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: Data(sample.utf8)))

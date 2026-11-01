@@ -206,3 +206,13 @@
 "fleet.kind.worker" = "Worker";
 "fleet.stat.cpu" = "CPU use";
 "fleet.stat.temperature" = "CPU temperature";
+"fleet.worker.step" = "Step %d";
+"fleet.worker.quiet" = "quiet for %@";
+"fleet.cancel.help" = "Stop this worker";
+"fleet.cancel.title" = "Stop this worker?";
+"fleet.cancel.message" = "“%@” will stop now and will not be retried elsewhere. Its work may be left half done.";
+"fleet.cancel.confirm" = "Stop Worker";
+"fleet.cancel.keep" = "Keep Running";
+"fleet.cancel.pending" = "Stopping…";
+"fleet.cancel.failedTitle" = "Couldn’t stop the worker";
+"fleet.ok" = "OK";

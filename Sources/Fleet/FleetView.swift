@@ -44,7 +44,7 @@ struct FleetView: View {
     @ViewBuilder
     private var detail: some View {
         if let state = store.devices.first(where: { $0.id == selection }) {
-            FleetDeviceDetail(state: state, language: language)
+            FleetDeviceDetail(state: state, store: store, language: language)
         } else {
             FleetOverview(store: store, language: language) { selection = $0 }
         }
@@ -151,6 +151,26 @@ enum FleetText {
         case .connecting: return "fleet.link.connecting"
         case .offline: return "fleet.link.offline"
         }
+    }
+
+    /// `minimax · Running · Step 6 · Edit foo.swift`: what it is doing, as far as
+    /// anyone can tell. There is no percentage, because the agent can't know one.
+    static func workerDetail(_ worker: FleetWorker, language: AppLanguage) -> String {
+        var parts = [worker.provider]
+        if let model = worker.model, !model.isEmpty { parts.append(UsageFormat.modelName(model)) }
+        parts.append(language.t("fleet.worker.\(worker.state.rawValue)"))
+        if let host = worker.remoteHost { parts.append("→ \(host)") }
+        if worker.state == .running {
+            if let steps = worker.steps { parts.append(language.t("fleet.worker.step", steps)) }
+            if let tool = worker.lastTool, !tool.isEmpty {
+                let file = worker.lastFile ?? ""
+                parts.append(file.isEmpty ? tool : "\(tool) \(file)")
+            }
+            if worker.isQuiet, let idle = worker.idleSeconds {
+                parts.append(language.t("fleet.worker.quiet", duration(idle)))
+            }
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// `90s`, `14m`, `2h 5m`. Compact on purpose, as these sit in narrow columns.
@@ -284,7 +304,9 @@ private struct FleetStat: View {
 
 private struct FleetDeviceDetail: View {
     let state: FleetDeviceState
+    @ObservedObject var store: FleetStore
     let language: AppLanguage
+    @State private var confirming: FleetWorker?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -309,6 +331,28 @@ private struct FleetDeviceDetail: View {
                 sessions(snapshot)
             }
         }
+        // Stopping a task can't be undone and may leave its work half done.
+        .alert(language.t("fleet.cancel.title"), isPresented: isConfirming, presenting: confirming) { worker in
+            Button(language.t("fleet.cancel.confirm"), role: .destructive) {
+                store.cancel(worker, on: state)
+            }
+            Button(language.t("fleet.cancel.keep"), role: .cancel) {}
+        } message: { worker in
+            Text(language.t("fleet.cancel.message", worker.title.isEmpty ? worker.id : worker.title))
+        }
+        .alert(language.t("fleet.cancel.failedTitle"), isPresented: hasCancelError) {
+            Button(language.t("fleet.ok"), role: .cancel) {}
+        } message: {
+            Text(verbatim: store.cancelError ?? "")
+        }
+    }
+
+    private var isConfirming: Binding<Bool> {
+        Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })
+    }
+
+    private var hasCancelError: Binding<Bool> {
+        Binding(get: { store.cancelError != nil }, set: { if !$0 { store.cancelError = nil } })
     }
 
     private var header: some View {
@@ -365,7 +409,14 @@ private struct FleetDeviceDetail: View {
         if !snapshot.workers.isEmpty {
             FleetSection(title: language.t("fleet.section.workers")) {
                 ForEach(sortedWorkers(snapshot)) { worker in
-                    FleetWorkerRow(worker: worker, language: language)
+                    FleetWorkerRow(
+                        worker: worker,
+                        language: language,
+                        canCancel: store.canCancel(on: state) && worker.isCancellableHere,
+                        isCancelling: store.cancelling.contains(
+                            FleetStore.cancelKey(device: state.id, worker: worker.id)),
+                        onCancel: { confirming = worker }
+                    )
                 }
             }
         }
@@ -381,13 +432,13 @@ private struct FleetDeviceDetail: View {
     @ViewBuilder
     private func sessions(_ snapshot: FleetSnapshot) -> some View {
         FleetSection(title: language.t("fleet.section.sessions")) {
-            if snapshot.sessions.isEmpty {
+            if snapshot.ownSessions.isEmpty {
                 Text(language.t("fleet.noSessions"))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 6)
             }
-            ForEach(snapshot.sessions) { session in
+            ForEach(snapshot.ownSessions) { session in
                 FleetSessionRow(session: session, language: language)
             }
         }
@@ -447,6 +498,9 @@ private struct FleetModelRow: View {
 private struct FleetWorkerRow: View {
     let worker: FleetWorker
     let language: AppLanguage
+    var canCancel = false
+    var isCancelling = false
+    var onCancel: () -> Void = {}
 
     var body: some View {
         HStack(spacing: 10) {
@@ -470,15 +524,27 @@ private struct FleetWorkerRow: View {
                 .font(.body.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 52, alignment: .trailing)
+            if isCancelling {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 22)
+                    .help(language.t("fleet.cancel.pending"))
+            } else if canCancel {
+                Button(action: onCancel) {
+                    Image(systemName: "stop.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .frame(width: 22)
+                .help(language.t("fleet.cancel.help"))
+            }
         }
         .padding(.vertical, 6)
         .opacity(worker.remoteHost == nil ? 1 : 0.65)
     }
 
     private var detail: String {
-        var parts = [worker.provider, language.t("fleet.worker.\(worker.state.rawValue)")]
-        if let host = worker.remoteHost { parts.append("→ \(host)") }
-        return parts.joined(separator: " · ")
+        FleetText.workerDetail(worker, language: language)
     }
 
     private var symbol: String {

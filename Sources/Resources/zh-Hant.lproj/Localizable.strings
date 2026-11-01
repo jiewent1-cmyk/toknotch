@@ -206,3 +206,13 @@
 "fleet.kind.worker" = "Worker";
 "fleet.stat.cpu" = "CPU 使用率";
 "fleet.stat.temperature" = "CPU 溫度";
+"fleet.worker.step" = "第 %d 步";
+"fleet.worker.quiet" = "已 %@ 無輸出";
+"fleet.cancel.help" = "停止這個 worker";
+"fleet.cancel.title" = "停止這個 worker？";
+"fleet.cancel.message" = "「%@」會立即停止，也不會換家重跑。工作區可能留下沒改完的內容。";
+"fleet.cancel.confirm" = "停止 worker";
+"fleet.cancel.keep" = "繼續執行";
+"fleet.cancel.pending" = "正在停止…";
+"fleet.cancel.failedTitle" = "無法停止 worker";
+"fleet.ok" = "好";

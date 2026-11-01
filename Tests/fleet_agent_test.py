@@ -119,12 +119,13 @@ class Privacy(Base):
         with open(os.path.join(job, "prompt.md"), "w") as handle:
             handle.write("# Task: do it\n" + SECRET)
         with open(os.path.join(job, "out.json"), "w") as handle:
-            json.dump({"result": SECRET, "usage": {"input_tokens": 3, "output_tokens": 4}}, handle)
+            json.dump({"result": SECRET, "session_id": "s9", "usage": {"input_tokens": 3, "output_tokens": 4}}, handle)
         worker = self.report()["workers"][0]
         self.assertNotIn(SECRET, json.dumps(worker))
         self.assertEqual(worker["state"], "done")
         self.assertEqual(worker["usage"]["output"], 4)
         self.assertEqual(worker["provider"], "minimax")
+        self.assertEqual(worker["sessionId"], "s9")
 
 
 class Workers(Base):
@@ -251,6 +252,137 @@ class Vitals(Base):
         self.assertEqual(len(calls), 1)
         vitals.read(100.0 + self.agent.TEMPERATURE_INTERVAL)
         self.assertEqual(len(calls), 2)
+
+
+class Streams(Base):
+    def stream(self, path, *events):
+        with open(path, "a") as handle:
+            for event in events:
+                handle.write(json.dumps(event) + "\n")
+
+    def tool(self, ident, name, **inputs):
+        return {"type": "assistant", "session_id": "s1", "message": {"id": ident, "model": "m1", "content": [
+            {"type": "text", "text": SECRET}, {"type": "tool_use", "name": name, "input": inputs}]}}
+
+    def running_job(self):
+        folder = os.path.join(self.home, ".cache/mm-worker/jobs/20261101-000000-1-minimax")
+        os.makedirs(folder)
+        open(os.path.join(folder, "started"), "w").close()
+        with open(os.path.join(folder, "pid"), "w") as handle:
+            handle.write(str(os.getpid()))
+        return folder
+
+    def test_running_job_reports_steps_tool_and_file_name_only(self):
+        folder = self.running_job()
+        self.stream(os.path.join(folder, "out.json"),
+                    {"type": "system", "subtype": "init", "session_id": "s1", "model": "m1", "cwd": SECRET},
+                    self.tool("a", "Read", file_path="/secret/dir/one.py"),
+                    {"type": "user", "message": {"content": SECRET}},
+                    self.tool("a", "Edit", file_path="/secret/dir/two.py"),
+                    self.tool("b", "Bash", command=SECRET))
+        worker = self.report()["workers"][0]
+        self.assertEqual(worker["steps"], 2)
+        self.assertEqual(worker["lastTool"], "Bash")
+        self.assertNotIn("lastFile", worker)
+        self.assertEqual(worker["sessionId"], "s1")
+        self.assertNotIn("stream", worker)
+        self.assertNotIn(SECRET, json.dumps(worker))
+        self.assertNotIn("/secret", json.dumps(worker))
+
+    def test_file_name_without_its_folders(self):
+        folder = self.running_job()
+        self.stream(os.path.join(folder, "out.json"), self.tool("a", "Edit", file_path="/secret/dir/two.py"))
+        worker = self.report()["workers"][0]
+        self.assertEqual(worker["lastFile"], "two.py")
+
+    def test_tokens_come_from_the_session_log(self):
+        folder = self.running_job()
+        self.stream(os.path.join(folder, "out.json"), {"type": "assistant", "session_id": "s1", "message": {
+            "id": "a", "model": "m1", "content": [], "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        self.write("s1.jsonl", assistant("a", self.now, 50))
+        log = self.agent.SessionLog()
+        log.scan(time.time())
+        worker = self.agent.snapshot(log, time.time())["workers"][0]
+        self.assertEqual(worker["usage"]["output"], 50)
+
+    def test_progress_is_read_incrementally_and_survives_a_half_line(self):
+        folder = self.running_job()
+        path = os.path.join(folder, "out.json")
+        line = json.dumps(self.tool("a", "Read"))
+        with open(path, "w") as handle:
+            handle.write(line[:30])
+        streams = self.agent.WorkerStreams()
+        self.assertNotIn("steps", streams.progress(path, time.time()))
+        with open(path, "a") as handle:
+            handle.write(line[30:] + "\n")
+        self.assertEqual(streams.progress(path, time.time())["steps"], 1)
+        self.stream(path, self.tool("b", "Edit"))
+        self.assertEqual(streams.progress(path, time.time())["lastTool"], "Edit")
+
+    def test_a_job_with_no_stream_yet_still_lists(self):
+        self.running_job()
+        worker = self.report()["workers"][0]
+        self.assertEqual(worker["state"], "running")
+        self.assertNotIn("steps", worker)
+
+    def test_a_given_name_beats_the_prompt(self):
+        folder = self.running_job()
+        with open(os.path.join(folder, "prompt.md"), "w") as handle:
+            handle.write("# Task: from prompt\n")
+        with open(os.path.join(folder, "name"), "w") as handle:
+            handle.write("given name\n")
+        self.assertEqual(self.report()["workers"][0]["title"], "given name")
+
+
+class Cancel(Base):
+    def job(self, pid):
+        folder = os.path.join(self.home, ".cache/mm-worker/jobs/20261101-000000-1-minimax")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "pid"), "w") as handle:
+            handle.write(str(pid))
+        return folder
+
+    def test_bad_ids_are_refused(self):
+        for bad in ("", "../../etc", "1-2-3; rm -rf /", "*", "1-2"):
+            self.assertEqual(self.agent.cancel(bad)["ok"], False, bad)
+
+    def test_unknown_run_is_refused(self):
+        os.makedirs(os.path.join(self.home, ".cache/mm-worker/runs"))
+        self.assertFalse(self.agent.cancel("20261101-000000-999999")["ok"])
+
+    def test_dead_job_is_refused_and_not_marked(self):
+        folder = self.job(999999)
+        self.assertFalse(self.agent.cancel("20261101-000000-1")["ok"])
+        self.assertFalse(os.path.exists(os.path.join(folder, "rc")))
+
+    def test_finished_job_keeps_its_result(self):
+        folder = self.job(os.getpid())
+        with open(os.path.join(folder, "rc"), "w") as handle:
+            handle.write("0\n")
+        result = self.agent.cancel("20261101-000000-1")
+        self.assertFalse(result["ok"])
+        with open(os.path.join(folder, "rc")) as handle:
+            self.assertEqual(handle.read(), "0\n")
+
+    def test_a_pid_that_is_not_a_worker_is_left_alone(self):
+        state = os.path.join(self.home, ".cache/mm-worker")
+        os.makedirs(os.path.join(state, "runs"))
+        os.makedirs(os.path.join(state, "slots/claude/1"))
+        pid = str(os.getpid())  # this test process: alive, but not mm-worker
+        with open(os.path.join(state, "slots/claude/1/pid"), "w") as handle:
+            handle.write(pid)
+        result = self.agent.cancel("20261101-000000-" + pid)
+        self.assertEqual(result, {"ok": False, "error": "not a worker"})
+
+    def test_a_worker_sent_elsewhere_is_refused_here(self):
+        state = os.path.join(self.home, ".cache/mm-worker")
+        os.makedirs(os.path.join(state, "runs"))
+        os.makedirs(os.path.join(state, "slots/claude/1"))
+        pid = str(os.getpid())
+        with open(os.path.join(state, "slots/claude/1/pid"), "w") as handle:
+            handle.write(pid)
+        open(os.path.join(state, "runs", "20261101-000000-%s.remote" % pid), "w").close()
+        self.assertEqual(self.agent.cancel("20261101-000000-" + pid)["error"], "runs on another machine")
 
 
 class Timestamps(Base):
