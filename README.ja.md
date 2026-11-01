@@ -1,3 +1,5 @@
+> **これはフォークです。** このリポジトリは [ReffWu/toknotch](https://github.com/ReffWu/toknotch) のフォークで、**Fleet**（ssh 越しに複数マシンのエージェントを監視し、各マシンのワーカー振り分けルールを編集できるウィンドウ）を追加しています。下のダウンロードリンクがインストールするのは **Fleet を含まない上流の TokNotch** です。フォークの紹介と完全なガイドは [README.md](README.md)（英語）を参照してください。
+
 <div align="center">
 
 <img src="docs/assets/icon.png" width="128" height="128" alt="TokNotch" />

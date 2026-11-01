@@ -1,3 +1,5 @@
+> **這是一個 fork。** 此儲存庫是 [ReffWu/toknotch](https://github.com/ReffWu/toknotch) 的 fork，新增了 **Fleet**：一個透過 ssh 監看多台機器上的 Agent、並修改各機器派工規則的視窗。下方的下載連結安裝的是**不含 Fleet 的原版 TokNotch**。fork 的介紹與完整指南請見 [README.md](README.md)（英文）。
+
 <div align="center">
 
 <img src="docs/assets/icon.png" width="128" height="128" alt="TokNotch" />

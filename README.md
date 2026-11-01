@@ -4,26 +4,54 @@
 
 # TokNotch
 
-**How many times over has each AI plan paid for itself?**
-
-<a href="https://github.com/ReffWu/toknotch/releases/latest/download/TokNotch.dmg">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/download-en-dark.png">
-    <img src="docs/assets/readme/download-en-light.png" height="52" alt="Download for Mac">
-  </picture>
-</a>
-
-<sub>Free · macOS 14 or later · Signed and notarized by Apple</sub>
-
 English · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 </div>
 
+Forked from [ReffWu/toknotch](https://github.com/ReffWu/toknotch) (this
+repository: `jiewent1-cmyk/toknotch`). TokNotch shows how far your AI plans
+have paid for themselves, at the edge of your screen. This fork keeps all of
+that and adds **Fleet**, which extends it to several machines:
+
+- **Fleet window** — watches the agents on every machine you list, over your
+  own ssh: online state, CPU use and temperature, today's tokens, live Claude
+  Code sessions and worker progress, with a stop button. Nothing needs
+  installing on the machines being watched, and they keep working when your
+  Mac is off.
+- **Per-machine dispatch rules** — edit each machine's enabled providers,
+  slots, per-level models, balance mode and provider order from the same
+  window. A save that would overwrite someone else's change is refused.
+- **Provider totals** — slots added up across machines, against an optional
+  per-account limit, with a warning when they add up to more. A warning only:
+  each machine limits itself.
+- **mm-worker** — a Python dispatcher, installed from the app, that runs
+  Claude Code tasks on MiniMax, Zhipu, Claude and Qwen with task levels,
+  per-provider slots and failover with cooldown.
+- **Remote usage sync** — a button that runs your own
+  `~/bin/tokscale-remote-sync`, so the rings count the other machines too.
+- **No telemetry** — the upstream usage heartbeat is removed.
+
+**Getting it:** there is no release of this fork and no download. Build from
+source:
+
+```sh
+brew install xcodegen
+make run
+```
+
+**The guide:** [docs/FLEET.md](docs/FLEET.md) — what Fleet does, how to
+configure it, and its [security notes](docs/FLEET.md#security-and-privacy).
+简体中文版：[docs/FLEET.zh-CN.md](docs/FLEET.zh-CN.md)。
+
+---
+
+## The original TokNotch
+
+**How many times over has each AI plan paid for itself?**
+
 <p align="center">
   <img src="docs/assets/readme/hero-en.png" alt="How many times over has each AI plan paid for itself?">
 </p>
-
----
 
 Claude Code, Codex and the rest — priced against the published API rates,
 sitting at the edge of your screen.
@@ -44,7 +72,7 @@ Or, when a plan hasn't earned its keep yet: **$18 to go**.
 
 ---
 
-## The payback number
+### The payback number
 
 Tell TokNotch what a plan costs and when it renews. That's the whole setup.
 
@@ -61,7 +89,7 @@ of the month that's nearly a whole period of somebody else's usage.
 
 ---
 
-## And three rings, always on
+### And three rings, always on
 
 **Today · This month · All time.** Token counts, at the edge of the screen.
 
@@ -74,7 +102,7 @@ nothing here to run out of.
 
 ---
 
-## What it counts
+### What it counts
 
 Everything your coding tools have actually run, grouped by **who made the model**
 rather than who billed for it — so a Qwen you ran locally still counts as Qwen,
@@ -92,7 +120,7 @@ ships inside the app.
 
 ---
 
-## Nothing to install. Nothing leaves your Mac.
+### Nothing to install. Nothing leaves your Mac.
 
 No Homebrew. No npm. No Node. No account, no sign-in, no API key.
 
@@ -106,9 +134,14 @@ are ever read from it — the plan type and its dates. The access token, refresh
 token and API key sitting beside them are never read, never copied, never
 logged.
 
+Fleet is the second exception, and it belongs to this fork: it talks, over
+your own ssh, to the machines you list in its configuration — and nothing
+beyond them. What it reads and writes there is spelled out in the
+[Fleet guide's security notes](docs/FLEET.md#security-and-privacy).
+
 ---
 
-## Where it sits
+### Where it sits
 
 **Any of the four edges.** Left or right as a slim column; top or bottom as a
 wide bar. On a MacBook with a notch, the top edge runs up to meet it so the two
@@ -125,7 +158,7 @@ It knows about your Dock and your menu bar, and moves when they do.
 
 ---
 
-## It speaks your language
+### It speaks your language
 
 English · 简体中文 · 繁體中文 · 日本語 · 한국어 · Deutsch · Français · Español · Italiano ·
 Português (Brasil) · Nederlands · Polski · Русский · Türkçe · Tiếng Việt · العربية
@@ -133,36 +166,42 @@ Português (Brasil) · Nederlands · Polski · Русский · Türkçe · Ti�
 Not just the words. Numbers, money and dates follow each language's own
 conventions — 万 and 亿 in Chinese, k/M/B in English, Mrd. in German.
 
+Fleet's own text is translated into English, Simplified Chinese and
+Traditional Chinese; the other thirteen languages show English there.
+
 ---
 
-## Getting it
+### Getting it
 
-[Download TokNotch.dmg](https://github.com/ReffWu/toknotch/releases/latest/download/TokNotch.dmg),
-open it and drag TokNotch to Applications. It is signed with a Developer ID and
-notarized by Apple, opens like any other app, starts with your Mac, and keeps
-itself up to date after that. Every build is on the
-[Releases page](https://github.com/ReffWu/toknotch/releases).
+The [TokNotch.dmg](https://github.com/ReffWu/toknotch/releases/latest/download/TokNotch.dmg)
+on the upstream [Releases page](https://github.com/ReffWu/toknotch/releases) is
+**upstream TokNotch, without Fleet**. This fork publishes no release: to get
+Fleet, build it from source — see
+[docs/FLEET.md · Build and install from source](docs/FLEET.md#build-and-install-from-source).
 
-**Requires macOS 14 (Sonoma) or newer.**
+Upstream's download is signed with a Developer ID and notarized by Apple, opens
+like any other app, and starts with your Mac. **Requires macOS 14 (Sonoma) or
+newer.**
 
-### Building it yourself
+#### Building this fork
 
 ```sh
 brew install xcodegen
 make run
 ```
 
-A Debug build, ad-hoc signed, which is enough to run and develop against.
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the rest, and
-[docs/RELEASING.md](docs/RELEASING.md) for how a release is cut.
+A Debug build, ad-hoc signed, which is enough to run and develop against. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the rest, and
+[docs/FLEET.md](docs/FLEET.md) for what to do next.
 
 ---
 
-## Under the hood
+### Under the hood
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) walks through the pieces. The short
 version: a borderless `NSPanel` that draws a real notch shape, a poller around
-the bundled tokscale binary, and a SwiftUI card that unfolds out of the edge.
+the bundled tokscale binary, and a SwiftUI card that unfolds out of the edge —
+plus `docs/FLEET.md` for the ssh, the agent and the dispatcher this fork adds.
 
 ---
 
@@ -173,7 +212,9 @@ and was rewritten around local usage accounting. The original is MIT licensed an
 its copyright is kept in [LICENSE](LICENSE).
 
 Usage figures come from [tokscale](https://github.com/junhoyeo/tokscale) (MIT),
-bundled in `Vendor/tokscale/`. Updates use [Sparkle](https://sparkle-project.org) (MIT).
+bundled in `Vendor/tokscale/`. Upstream updates used
+[Sparkle](https://sparkle-project.org) (MIT); the updater is switched off in
+this fork, which removes the update feed from the build.
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License

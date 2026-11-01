@@ -1,3 +1,5 @@
+> **포크 안내.** 이 저장소는 [ReffWu/toknotch](https://github.com/ReffWu/toknotch)의 포크로, **Fleet**(ssh로 여러 머신의 에이전트를 감시하고 각 머신의 작업 분배 규칙을 편집하는 창)을 추가합니다. 아래 다운로드 링크가 설치하는 것은 **Fleet이 없는 업스트림 TokNotch**입니다. 포크 소개와 전체 가이드는 [README.md](README.md)(영어)를 참고하세요.
+
 <div align="center">
 
 <img src="docs/assets/icon.png" width="128" height="128" alt="TokNotch" />
