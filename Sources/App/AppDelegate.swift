@@ -9,6 +9,7 @@ struct MenuBarContext {
     let updater: Updater
     let openSettings: () -> Void
     let about: () -> Void
+    let openFleet: () -> Void
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
@@ -19,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var settings: SettingsWindowController?
     private var whatsNew: WhatsNewWindowController?
     private var about: AboutWindowController?
+    private var fleet: FleetWindowController?
     /// Held for the life of the app: releasing it stops the scheduled checks.
     private var updater: Updater?
     private var cancellables = Set<AnyCancellable>()
@@ -126,10 +128,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         self.about = about
         settings.onAbout = { [weak about] in about?.show() }
 
+        let fleet = FleetWindowController(store: FleetStore(), preferences: preferences)
+        self.fleet = fleet
+        // The notch's right-click menu is the way in on a Mac whose hardware
+        // notch hides the menu bar icon. These items are not only for signing
+        // in: the menu lists whatever is put here after Refresh.
+        coordinator.signInItems = [(
+            title: preferences.appLanguage.t("fleet.open"),
+            action: { [weak fleet] in fleet?.show() }
+        )]
+
         menuBar = MenuBarContext(
             preferences: preferences, store: store, updater: updater,
             openSettings: { [weak settings] in settings?.show() },
-            about: { [weak about] in about?.show() }
+            about: { [weak about] in about?.show() },
+            openFleet: { [weak fleet] in fleet?.show() }
         )
 
         DistributedNotificationCenter.default().addObserver(

@@ -175,3 +175,32 @@
 "menu.syncDevices" = "同步其他设备";
 "menu.syncing" = "同步中…";
 "menu.syncPartial" = "%1$d/%2$d 台成功";
+
+// Fleet
+"fleet.open" = "设备与 Agent…";
+"fleet.overview" = "总览";
+"fleet.devices" = "设备";
+"fleet.link.live" = "在线";
+"fleet.link.connecting" = "连接中…";
+"fleet.link.offline" = "离线";
+"fleet.lastSeen" = "最后在线";
+"fleet.load" = "负载";
+"fleet.activeCount" = "%d 个活跃";
+"fleet.stat.online" = "在线";
+"fleet.stat.activeSessions" = "活跃会话";
+"fleet.stat.workers" = "运行中 worker";
+"fleet.stat.today" = "今日 token";
+"fleet.section.models" = "今日各模型用量";
+"fleet.section.workers" = "Worker";
+"fleet.section.sessions" = "会话";
+"fleet.noSessions" = "最近 6 小时没有会话。";
+"fleet.usageDetail" = "输入 %1$@，输出 %2$@，缓存读 %3$@，缓存写 %4$@";
+"fleet.worker.running" = "运行中";
+"fleet.worker.done" = "已完成";
+"fleet.worker.failed" = "失败";
+"fleet.worker.timeout" = "超时";
+"fleet.worker.cancelled" = "已取消";
+"fleet.worker.lost" = "已失联";
+"fleet.session.active" = "活跃";
+"fleet.kind.interactive" = "交互";
+"fleet.kind.worker" = "Worker";

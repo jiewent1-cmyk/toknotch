@@ -175,3 +175,32 @@
 "menu.syncDevices" = "Sync other devices";
 "menu.syncing" = "Syncing…";
 "menu.syncPartial" = "%1$d of %2$d synced";
+
+// Fleet
+"fleet.open" = "Fleet…";
+"fleet.overview" = "Overview";
+"fleet.devices" = "Devices";
+"fleet.link.live" = "Online";
+"fleet.link.connecting" = "Connecting…";
+"fleet.link.offline" = "Offline";
+"fleet.lastSeen" = "Last seen";
+"fleet.load" = "Load";
+"fleet.activeCount" = "%d active";
+"fleet.stat.online" = "Online";
+"fleet.stat.activeSessions" = "Active sessions";
+"fleet.stat.workers" = "Workers running";
+"fleet.stat.today" = "Tokens today";
+"fleet.section.models" = "Today by model";
+"fleet.section.workers" = "Workers";
+"fleet.section.sessions" = "Sessions";
+"fleet.noSessions" = "No sessions in the last 6 hours.";
+"fleet.usageDetail" = "Input %1$@, output %2$@, cache read %3$@, cache write %4$@";
+"fleet.worker.running" = "Running";
+"fleet.worker.done" = "Done";
+"fleet.worker.failed" = "Failed";
+"fleet.worker.timeout" = "Timed out";
+"fleet.worker.cancelled" = "Cancelled";
+"fleet.worker.lost" = "Lost";
+"fleet.session.active" = "Active";
+"fleet.kind.interactive" = "Interactive";
+"fleet.kind.worker" = "Worker";

@@ -14,6 +14,7 @@ struct MenuBarPanel: View {
     @ObservedObject var updater: Updater
     let onOpenSettings: () -> Void
     let onAbout: () -> Void
+    var onOpenFleet: () -> Void = {}
 
     private var language: AppLanguage { preferences.appLanguage }
 
@@ -162,6 +163,7 @@ struct MenuBarPanel: View {
 
     private var actions: some View {
         VStack(spacing: 0) {
+            PanelAction(symbol: "server.rack", title: language.t("fleet.open"), action: onOpenFleet)
             if RemoteSync.isAvailable {
                 PanelAction(symbol: "desktopcomputer.and.arrow.down",
                             title: language.t("menu.syncDevices"),

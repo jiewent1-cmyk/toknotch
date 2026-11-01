@@ -175,3 +175,32 @@
 "menu.syncDevices" = "同步其他裝置";
 "menu.syncing" = "同步中…";
 "menu.syncPartial" = "%1$d/%2$d 台成功";
+
+// Fleet
+"fleet.open" = "裝置與 Agent…";
+"fleet.overview" = "總覽";
+"fleet.devices" = "裝置";
+"fleet.link.live" = "上線";
+"fleet.link.connecting" = "連線中…";
+"fleet.link.offline" = "離線";
+"fleet.lastSeen" = "最後上線";
+"fleet.load" = "負載";
+"fleet.activeCount" = "%d 個活躍";
+"fleet.stat.online" = "上線";
+"fleet.stat.activeSessions" = "活躍工作階段";
+"fleet.stat.workers" = "執行中 worker";
+"fleet.stat.today" = "今日 token";
+"fleet.section.models" = "今日各模型用量";
+"fleet.section.workers" = "Worker";
+"fleet.section.sessions" = "工作階段";
+"fleet.noSessions" = "最近 6 小時沒有工作階段。";
+"fleet.usageDetail" = "輸入 %1$@，輸出 %2$@，快取讀 %3$@，快取寫 %4$@";
+"fleet.worker.running" = "執行中";
+"fleet.worker.done" = "已完成";
+"fleet.worker.failed" = "失敗";
+"fleet.worker.timeout" = "逾時";
+"fleet.worker.cancelled" = "已取消";
+"fleet.worker.lost" = "已失聯";
+"fleet.session.active" = "活躍";
+"fleet.kind.interactive" = "互動";
+"fleet.kind.worker" = "Worker";

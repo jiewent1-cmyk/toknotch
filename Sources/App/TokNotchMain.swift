@@ -35,7 +35,8 @@ private struct MenuBarRoot: View {
         if let context = app.menuBar {
             MenuBarPanel(preferences: context.preferences, store: context.store,
                          updater: context.updater,
-                         onOpenSettings: context.openSettings, onAbout: context.about)
+                         onOpenSettings: context.openSettings, onAbout: context.about,
+                         onOpenFleet: context.openFleet)
         }
     }
 }
