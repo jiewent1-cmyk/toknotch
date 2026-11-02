@@ -86,7 +86,8 @@ needs installing to be watched, and it exits when the connection ends.
 connections run only while the window is open. `mm-worker.py` is the dispatcher
 each machine runs, installed from the app.
 
-[`FLEET-RULES.md`](FLEET-RULES.md) is the contract between the three.
+[`FLEET-RULES.md`](FLEET-RULES.md) is the contract between the three, and
+[`FLEET-USAGE.md`](FLEET-USAGE.md) the one behind the Usage page.
 
 `Tests/fleet_agent_test.py` and `Tests/mm_worker_test.py` run on their own with
 `python3`. The remote tests need `setsid`, so they only run on Linux.

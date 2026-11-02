@@ -7,10 +7,11 @@ struct FleetView: View {
 
     @ObservedObject var store: FleetStore
     @ObservedObject var preferences: Preferences
-    /// A device id, or `overview`.
+    /// A device id, `overview` or `usage`.
     @State var selection: String? = FleetView.overview
 
     private static let overview = "__overview__"
+    static let usage = "__usage__"
     private var language: AppLanguage { preferences.appLanguage }
 
     var body: some View {
@@ -31,6 +32,8 @@ struct FleetView: View {
         List(selection: $selection) {
             Label(language.t("fleet.overview"), systemImage: "square.grid.2x2")
                 .tag(Self.overview)
+            Label(language.t("fleet.usage.title"), systemImage: "chart.bar.xaxis")
+                .tag(Self.usage)
             Section(language.t("fleet.devices")) {
                 ForEach(store.devices) { state in
                     FleetDeviceRow(state: state, language: language)
@@ -45,6 +48,8 @@ struct FleetView: View {
     private var detail: some View {
         if let state = store.devices.first(where: { $0.id == selection }) {
             FleetDeviceDetail(state: state, store: store, language: language)
+        } else if selection == Self.usage {
+            FleetUsageView(store: store, language: language) { selection = $0 }
         } else {
             FleetOverview(store: store, language: language) { selection = $0 }
         }

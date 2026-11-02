@@ -24,6 +24,12 @@ it. This guide is also available in
 - **Each machine's page** — online state, CPU use, load average, CPU
   temperature, today's tokens by model, and the sessions on it. There is
   no GPU monitoring.
+- **Usage page** — token use across machines and accounts, for today, 7 days or
+  30 days, viewed by machine, account or model, with or without cache reads: a
+  total, the change against the previous period, daily stacked bars and a
+  breakdown you can unfold. History is cached on the Mac, so an offline machine
+  still counts and says when it last reported. See
+  [FLEET-USAGE.md](FLEET-USAGE.md).
 - **Live worker progress** — name, provider, model, step, the tool running
   now, the file it last touched, tokens, and how long it has been quiet. A
   stop button with a confirmation.
@@ -401,6 +407,11 @@ files — those are read only to tell whether a key is set.
   that the key variable in `~/.config/<provider>/env` is non-empty and
   reports a boolean; the window shows *Configured* or *No key on this
   machine*. Keys are never copied to your Mac or displayed.
+- **Account names are reported.** To group tokens by who pays for them, the agent
+  reports the OS account name and, from `oauthAccount` in `~/.claude.json`, the
+  Claude email, plan name and organization name. Nothing else in that file is
+  reported. They travel over your ssh and are shown in the window and kept in
+  `~/Library/Application Support/TokNotch/fleet-usage.json` on your Mac.
 - **`sudoUser` is read-only.** An account read through someone else's sudo
   cannot have its workers stopped, rules changed, or dispatcher installed
   from the window.
@@ -418,7 +429,7 @@ files — those are read only to tell whether a key is set.
 As of commit `ef0603f`:
 
 ```sh
-python3 Tests/fleet_agent_test.py     # 65 tests, all pass
+python3 Tests/fleet_agent_test.py     # 85 tests, all pass
 python3 Tests/mm_worker_test.py       # 88 tests; all pass on Linux
 make test                             # Swift suites; see below
 ```
@@ -443,6 +454,14 @@ Stated plainly:
   person, not automation. The stop button, the rules editor, the
   confirmation dialogs and the install button are untested by hand. The
   logic underneath them was tested on real machines through the store code.
+- **The Usage page was checked in rendered images and with real logs, not by
+  hand.** Hovering, unfolding by click and animation haven't been tried in a real
+  session. Its history scan was measured on a Mac and a Linux machine, not on a
+  small board such as a Raspberry Pi.
+- **Two machines with the same hostname and OS account count as one** on the Usage
+  page, as they look like the same logs listed twice.
+- **The Usage page can't tell API keys of one vendor apart**, so MiniMax or Zhipu
+  tokens are one row per vendor, however many keys are in use.
 - **Closing the window** and the cleanup of its connections was not checked
   in the real app.
 - **The notch right-click entry did not work for one user**, and the cause
@@ -484,6 +503,7 @@ Stated plainly:
 | `Sources/Fleet/FleetStore.swift` | Device states; save, reset, install and cancel actions; totals |
 | `Sources/Fleet/FleetConnection.swift` | The ssh transport: agent lifecycle, watchdog, one-shot commands |
 | `Sources/Fleet/FleetModels.swift` | Snapshot, device and types; reading and writing `fleet.json` |
+| `Sources/Fleet/FleetUsage.swift`, `Sources/Fleet/FleetUsageView.swift` | The Usage page: grouping, cache and view |
 | `Sources/Fleet/FleetRules.swift` | Rules validation, defaults, dispatcher status |
 | `Sources/Fleet/FleetWindowController.swift` | The window itself; starts and stops the connections |
 | `Sources/Resources/fleet-agent.py` | The agent piped over ssh |
@@ -491,5 +511,6 @@ Stated plainly:
 | `Tests/FleetTests.swift` | Swift tests for the above |
 | `Tests/fleet_agent_test.py`, `Tests/mm_worker_test.py` | The Python suites |
 | `Tests/RemoteSyncTests.swift` | Tests for the remote usage sync |
+| [FLEET-USAGE.md](FLEET-USAGE.md) | Usage history contract and grouping rules |
 | [FLEET-RULES.md](FLEET-RULES.md) | The rules and state-layout contract |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Where Fleet sits in the app |

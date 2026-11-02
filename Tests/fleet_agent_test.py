@@ -451,7 +451,7 @@ class DispatcherReport(DispatcherBase):
         self.assertEqual(sorted(report["providers"]), ["claude", "minimax", "qwen", "zhipu"])
         for provider in report["providers"].values():
             self.assertEqual(provider, {"configured": False, "used": 0, "cooling": False, "coolingReason": ""})
-        self.assertEqual(self.report()["agentVersion"], 4)
+        self.assertEqual(self.report()["agentVersion"], 5)
 
     def test_version_comes_from_reading_the_file(self):
         marker = os.path.join(self.home, "ran")
@@ -616,7 +616,9 @@ class DispatcherReport(DispatcherBase):
 
     def test_once_from_stdin_prints_a_snapshot_with_the_dispatcher(self):
         report, _ = self.cli("--once")
-        self.assertEqual(report["agentVersion"], 4)
+        self.assertEqual(report["agentVersion"], 5)
+        self.assertTrue(report["usageHistory"]["complete"])
+        self.assertIsNone(report["claudeAccount"])
         self.assertEqual(report["dispatcher"]["rules"], self.agent.DEFAULT_RULES)
         self.assertIn("used", report["dispatcher"]["providers"]["minimax"])
 
@@ -883,6 +885,257 @@ class KeyPrivacy(DispatcherBase):
         rules = copy.deepcopy(self.agent.DEFAULT_RULES)
         rules["levels"]["simple"]["minimax"] = model
         return rules
+
+
+def days_ago(now, days, hour=12):
+    t = time.localtime(now)
+    return time.mktime((t.tm_year, t.tm_mon, t.tm_mday - days, hour, 0, 0, 0, 0, -1))
+
+
+def day_of(epoch):
+    return time.strftime("%Y-%m-%d", time.localtime(epoch))
+
+
+class History(Base):
+    def scanned(self, now=None):
+        now = self.now if now is None else now
+        log = self.agent.SessionLog()
+        history = self.agent.UsageHistory()
+        log.scan(now)
+        history.finish(now)
+        return log, history, self.agent.snapshot(log, now, history=history)
+
+    def days(self):
+        return self.scanned()[2]["usageHistory"]["days"]
+
+    def test_a_past_day_is_in_days_and_not_in_today(self):
+        old = days_ago(self.now, 3)
+        self.write("s1.jsonl", assistant("old", old, 5), assistant("new", self.now, 7))
+        report = self.scanned()[2]
+        self.assertEqual(report["usageHistory"]["complete"], True)
+        self.assertEqual(report["usageHistory"]["progress"], 1.0)
+        self.assertEqual(report["usageHistory"]["days"],
+                         {day_of(old): {"m1": {"input": 1, "output": 5, "cacheRead": 10, "cacheWrite": 100}}})
+        self.assertEqual(report["todayByModel"]["m1"]["output"], 7)
+        self.assertEqual(report["sessions"][0]["usage"]["output"], 12)  # sessions keep their meaning
+
+    def test_one_message_in_two_files_counts_once_with_the_latest_usage(self):
+        when = days_ago(self.now, 2)
+        first = self.write("s1.jsonl", assistant("a", when, 5), assistant("b", when, 1))
+        self.write("s2.jsonl", assistant("a", when + 10, 50, session="s2"))
+        os.utime(first, (self.now - 3600, self.now - 3600))  # the resumed copy is newer
+        self.assertEqual(self.days()[day_of(when)]["m1"],
+                         {"input": 2, "output": 51, "cacheRead": 20, "cacheWrite": 200})
+
+    def test_synthetic_and_unusable_lines_are_left_out(self):
+        when = days_ago(self.now, 2)
+        self.write("s1.jsonl", assistant("a", when, 5, model="<synthetic>"), '{"usage": nope', "[]",
+                   json.dumps({"type": "user", "message": {"id": "u", "usage": {"output_tokens": 9}},
+                               "timestamp": stamp(when)}))
+        self.assertEqual(self.days(), {})
+
+    def test_only_the_29_days_before_today_are_reported(self):
+        self.write("s1.jsonl", *[assistant("d%d" % n, days_ago(self.now, n), n) for n in (1, 29, 30, 35)])
+        self.assertEqual(sorted(self.days()), [day_of(days_ago(self.now, 29)), day_of(days_ago(self.now, 1))])
+
+    def test_a_file_with_an_old_mtime_is_not_opened(self):
+        stale = self.write("old.jsonl", assistant("a", days_ago(self.now, 5), 5))
+        self.write("new.jsonl", assistant("b", days_ago(self.now, 5), 7))
+        then = days_ago(self.now, 31, 0)
+        os.utime(stale, (then, then))
+        real_open = open
+        opened = []
+
+        def spy(path, *args, **kwargs):
+            opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", spy):
+            days = self.days()
+        self.assertNotIn(stale, opened)
+        self.assertIn(os.path.join(self.project, "new.jsonl"), opened)
+        self.assertEqual(days[day_of(days_ago(self.now, 5))]["m1"]["output"], 7)
+
+    def test_each_pass_reads_at_most_the_limit(self):
+        limit = 64 << 10
+        self.agent.HISTORY_PASS_BYTES = limit
+        for index in range(3):
+            self.write("s%d.jsonl" % index, *[assistant("m%d-%d" % (index, n), days_ago(self.now, 1 + n % 20), 1,
+                                                        padding="x" * 900) for n in range(700)])
+        history = self.agent.UsageHistory()
+        history.step(self.now)
+        first = history.report(self.now)
+        self.assertFalse(first["complete"])
+        self.assertTrue(0 < first["progress"] < 1, first["progress"])
+        self.assertEqual(history.read_bytes, limit)
+        passes = 1
+        while not history.complete:
+            before = history.read_bytes
+            history.step(self.now)
+            self.assertLessEqual(history.read_bytes - before, limit)
+            passes += 1
+            self.assertLess(passes, 200)
+        self.assertGreater(passes, 20)
+        final = history.report(self.now)
+        self.assertEqual((final["complete"], final["progress"]), (True, 1.0))
+        self.assertEqual(final["days"], self.days())
+        self.assertEqual(sum(m["m1"]["output"] for m in final["days"].values()), 2100)
+
+    def test_partial_reports_are_sent_at_most_every_interval(self):
+        self.agent.HISTORY_PASS_BYTES = 1 << 10
+        self.write("s1.jsonl", *[assistant("m%d" % n, days_ago(self.now, 2), 1) for n in range(40)])
+        history = self.agent.UsageHistory()
+        history.step(self.now)
+        self.assertFalse(history.news(self.now)["complete"])
+        history.step(self.now + 2)
+        self.assertIsNone(history.news(self.now + 2))
+        self.assertFalse(history.news(self.now + 2 + self.agent.HISTORY_INTERVAL)["complete"])
+        history.finish(self.now + 20)
+        self.assertTrue(history.news(self.now + 20)["complete"])  # the finished one waits for nothing
+
+    def test_history_is_sent_only_when_a_past_day_changes(self):
+        self.agent.WALK_INTERVAL = 0
+        past = days_ago(self.now, 2)
+        self.write("s1.jsonl", assistant("a", past, 5))
+        log, history, first = self.scanned()
+        self.assertIn("usageHistory", first)
+        self.assertNotIn("usageHistory", self.agent.snapshot(log, self.now, history=history))
+        self.write("s1.jsonl", assistant("today", self.now, 9), assistant("a", past, 5))  # not past news
+        history.step(self.now)
+        self.assertNotIn("usageHistory", self.agent.snapshot(log, self.now, history=history))
+        self.write("s2.jsonl", assistant("b", past, 6, session="s2"))
+        history.step(self.now)
+        changed = self.agent.snapshot(log, self.now, history=history)
+        self.assertEqual(changed["usageHistory"]["days"][day_of(past)]["m1"]["output"], 11)
+        self.assertNotIn("usageHistory", self.agent.snapshot(log, self.now, history=history))
+
+    def test_without_clock_ignores_usage_history(self):
+        report = self.scanned()[2]
+        bare = dict(report)
+        del bare["usageHistory"]
+        self.assertEqual(self.agent._without_clock(report), self.agent._without_clock(bare))
+
+    def test_the_heartbeat_does_not_repeat_usage_history(self):
+        self.write("s1.jsonl", assistant("a", days_ago(self.now, 2), 5))
+        clock = [time.time()]
+        lines = []
+
+        class Out:
+            def write(self, text):
+                if len(lines) >= 15:
+                    raise BrokenPipeError
+                lines.append(json.loads(text))
+
+            def flush(self):
+                pass
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(self.agent.time, "time", lambda: clock[0]), \
+                mock.patch.object(self.agent.time, "sleep", sleep), \
+                mock.patch.object(self.agent.os, "nice", lambda n: 0), \
+                mock.patch.object(self.agent.sys, "stdout", Out()):
+            self.assertEqual(self.agent.main(["watch"]), 0)
+        sent = [line["usageHistory"] for line in lines if "usageHistory" in line]
+        self.assertEqual([h["complete"] for h in sent], [False, True])
+        self.assertEqual(sent[-1]["days"][day_of(days_ago(self.now, 2))]["m1"]["output"], 5)
+        self.assertGreater(clock[0] - self.now, 60)  # many heartbeats went by
+
+    def test_at_midnight_today_moves_into_days_once(self):
+        midnight = self.agent.local_midnight(self.now)
+        before, after = midnight - 120, midnight + 60
+        self.write("s1.jsonl", assistant("late", before - 60, 5), assistant("early", after - 30, 7))
+        log = self.agent.SessionLog()
+        history = self.agent.UsageHistory()
+        log.scan(before)
+        history.finish(before)
+        report = self.agent.snapshot(log, before, history=history)
+        self.assertEqual(report["todayByModel"]["m1"]["output"], 12)
+        self.assertNotIn(day_of(before), report["usageHistory"]["days"])
+        log.scan(after)
+        history.step(after)
+        report = self.agent.snapshot(log, after, history=history)
+        self.assertEqual(report["todayByModel"]["m1"]["output"], 7)
+        self.assertEqual(report["usageHistory"]["days"],
+                         {day_of(before): {"m1": {"input": 1, "output": 5, "cacheRead": 10, "cacheWrite": 100}}})
+
+    def test_old_days_keep_totals_and_ignore_repeats(self):
+        self.agent.WALK_INTERVAL = 0
+        old = days_ago(self.now, 5)
+        self.write("s1.jsonl", assistant("a", old, 5), assistant("b", days_ago(self.now, 1), 6))
+        log, history, report = self.scanned()
+        self.assertEqual(set(history.detail), {"b"})  # only yesterday and today keep detail
+        self.write("s2.jsonl", assistant("a", old, 5, session="s2"))  # a resumed session's copy
+        history.step(self.now)
+        self.assertEqual(history.report(self.now)["days"], report["usageHistory"]["days"])
+
+    def test_a_message_the_history_dates_earlier_is_not_today_too(self):
+        # Seen today in today's file, but earlier in an older file.
+        older = self.write("old.jsonl", assistant("a", days_ago(self.now, 2), 5))
+        os.utime(older, (self.now - 2 * 86400, self.now - 2 * 86400))
+        self.write("s1.jsonl", assistant("a", self.now, 5), assistant("b", self.now, 7))
+        report = self.scanned()[2]
+        self.assertEqual(report["todayByModel"]["m1"]["output"], 7)
+        self.assertEqual(report["usageHistory"]["days"][day_of(days_ago(self.now, 2))]["m1"]["output"], 5)
+
+
+class Account(DispatcherBase):
+    def config(self, value):
+        text = value if isinstance(value, str) else json.dumps(value)
+        return self.put(".claude.json", text)
+
+    def account(self):
+        return self.report()["claudeAccount"]
+
+    def test_email_plan_and_organization(self):
+        self.config({"numStartups": 3, "oauthAccount": {
+            "emailAddress": "a@example.com", "planDisplayName": "Claude Max", "organizationName": "Acme",
+            "accountUuid": "u-1", "displayName": "A"}})
+        self.assertEqual(self.account(), {"email": "a@example.com", "plan": "Claude Max", "organization": "Acme"})
+
+    def test_fields_other_than_email_may_be_null(self):
+        self.config({"oauthAccount": {"emailAddress": "a@example.com", "planDisplayName": 7}})
+        self.assertEqual(self.account(), {"email": "a@example.com", "plan": None, "organization": None})
+
+    def test_unknown_is_null(self):
+        self.assertIsNone(self.account())  # no file
+        for value in ({}, {"oauthAccount": None}, {"oauthAccount": {"planDisplayName": "Claude Max"}},
+                      {"oauthAccount": {"emailAddress": ""}}, "{not json", "[]", "\xff", "[" * 100000):
+            self.config(value)
+            self.assertIsNone(self.account(), str(value)[:30])
+
+    def test_an_oversized_file_is_skipped(self):
+        self.assertEqual(self.agent.ACCOUNT_LIMIT, 32 << 20)
+        self.agent.ACCOUNT_LIMIT = 200
+        good = {"oauthAccount": {"emailAddress": "a@example.com"}}
+        self.config(good)
+        self.assertEqual(self.account()["email"], "a@example.com")
+        self.config(dict(good, padding="x" * 300))
+        self.assertIsNone(self.account())
+
+    def test_read_at_most_every_interval(self):
+        reader = self.agent.ClaudeAccount()
+        self.assertIsNone(reader.read(100.0))
+        self.config({"oauthAccount": {"emailAddress": "a@example.com"}})
+        self.assertIsNone(reader.read(150.0))
+        self.assertEqual(reader.read(100.0 + self.agent.ACCOUNT_INTERVAL)["email"], "a@example.com")
+
+    def test_credentials_in_the_file_never_appear(self):
+        self.config({"primaryApiKey": FAKE_KEY, "customApiKeyResponses": {"approved": [FAKE_KEY]},
+                     "oauthAccount": {"emailAddress": "a@example.com", "accessToken": FAKE_KEY,
+                                      "refreshToken": FAKE_KEY, "planDisplayName": "Claude Max"}})
+        report = self.report()
+        self.assertEqual(report["claudeAccount"]["email"], "a@example.com")
+        for text in (json.dumps(report), self.cli("--once")[1]):
+            self.assertNotIn(FAKE_KEY, text)
+            self.assertNotIn(FAKE_KEY[3:], text)
+
+    def test_host_names_the_os_account(self):
+        import pwd
+        user = pwd.getpwuid(os.getuid()).pw_name
+        self.assertEqual(self.report()["host"]["user"], user)
+        self.assertEqual(self.cli("--once")[0]["host"]["user"], user)
 
 
 if __name__ == "__main__":

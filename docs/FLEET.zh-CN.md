@@ -18,6 +18,10 @@ Mac 上各个 AI 套餐的回本情况；Fleet 把这件事扩展到多台机器
   token；每台机器一张卡片；各提供商合计，并可对照账户上限。
 - **单台机器的页面** —— 在线状态、CPU 占用、负载、CPU 温度、今日各模型
   token、以及这台机器上的会话。不做 GPU 监控。
+- **用量页面** —— 跨机器、跨账户的 token 用量，范围有今日、7 天、30 天，可按机器、
+  账户或模型查看，也可不计缓存读取：总量、与上一周期的对比、每日堆叠柱状图和可
+  展开的明细。历史数据缓存在 Mac 上，离线的机器仍会计入，并标明最后上报时间。
+  见 [FLEET-USAGE.md](FLEET-USAGE.md)。
 - **worker 实时进度** —— 名称、提供商、模型、步数、当前工具、最后改动的文件、
   token、已多久无输出。停止按钮带确认。
 - **每台机器的规则编辑器** —— 各提供商的启用开关、槽位、每个任务级别用的模型、
@@ -357,6 +361,10 @@ agent 自己的说明是：`watch` 和 `--once` 是只读的。它们报告 toke
   `~/.config/<提供商>/env` 里的密钥变量是否非空并上报布尔值；窗口里显示
   「已配置」或「这台机器上没有密钥」。密钥永远不会被复制到你的 Mac，也不会被
   显示。
+- **会上报账户名称。** 为了按付费账户归类 token，agent 会上报系统账户名，以及
+  `~/.claude.json` 里 `oauthAccount` 的 Claude 邮箱、套餐名和组织名，这个文件的
+  其他内容不会上报。这些信息经你的 ssh 传回，显示在窗口里，并保存在你 Mac 上的
+  `~/Library/Application Support/TokNotch/fleet-usage.json`。
 - **`sudoUser` 只读。** 通过他人的 sudo 读取的账户，不能从窗口停止它的 worker、
   修改它的规则或安装调度器。
 - **会写入远端机器的操作只有三种**：停止它的一个 worker、保存或恢复它的规则、
@@ -370,7 +378,7 @@ agent 自己的说明是：`watch` 和 `--once` 是只读的。它们报告 toke
 截至 `ef0603f`：
 
 ```sh
-python3 Tests/fleet_agent_test.py     # 65 项，全部通过
+python3 Tests/fleet_agent_test.py     # 85 项，全部通过
 python3 Tests/mm_worker_test.py       # 88 项；Linux 上全部通过
 make test                             # Swift 套件，见下
 ```
@@ -392,6 +400,13 @@ make test                             # Swift 套件，见下
 - **窗口里的控件没有人在真实会话里点过**——真人没有，自动化也没有。停止按钮、
   规则编辑器、确认对话框、安装按钮都没有手工测过。它们底下的逻辑在真实机器上
   通过存储代码测过。
+- **用量页面是用渲染图和真实日志检查的，没有人工操作过。** 悬停、点击展开和动画
+  都没有在真实会话里试过。历史扫描只在 Mac 和 Linux 机器上实测过，没有在树莓派
+  这类小型设备上测过。
+- **主机名和系统账户都相同的两台机器，在用量页面上算一台**，因为看起来就是同一份
+  日志列了两次。
+- **用量页面分不清同一厂商的不同 API key**，所以 MiniMax、智谱每家一行，不管用了
+  几个 key。
 - **关闭窗口**以及随之而来的连接清理，没有在真实应用里核对过。
 - **刘海右键菜单入口对一位用户不起作用**，原因没有查明。设置侧栏那一行是可靠
   的入口。
@@ -428,6 +443,7 @@ make test                             # Swift 套件，见下
 | `Sources/Fleet/FleetStore.swift` | 设备状态；保存、恢复、安装、停止等动作；合计 |
 | `Sources/Fleet/FleetConnection.swift` | ssh 传输：agent 生命周期、看门狗、一次性命令 |
 | `Sources/Fleet/FleetModels.swift` | 快照、设备等类型；`fleet.json` 的读写 |
+| `Sources/Fleet/FleetUsage.swift`、`Sources/Fleet/FleetUsageView.swift` | 用量页面：归类、缓存和界面 |
 | `Sources/Fleet/FleetRules.swift` | 规则校验、默认值、调度器状态 |
 | `Sources/Fleet/FleetWindowController.swift` | 窗口本身；建立和断开连接 |
 | `Sources/Resources/fleet-agent.py` | 通过 ssh 管道送入的 agent |
@@ -435,5 +451,6 @@ make test                             # Swift 套件，见下
 | `Tests/FleetTests.swift` | 以上各项的 Swift 测试 |
 | `Tests/fleet_agent_test.py`、`Tests/mm_worker_test.py` | Python 测试套件 |
 | `Tests/RemoteSyncTests.swift` | 远程用量同步的测试 |
+| [FLEET-USAGE.md](FLEET-USAGE.md) | 用量历史契约和归类规则 |
 | [FLEET-RULES.md](FLEET-RULES.md) | 规则与状态布局契约 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Fleet 在应用中的位置 |

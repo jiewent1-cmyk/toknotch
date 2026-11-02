@@ -5,10 +5,13 @@ TokNotch pipes this file into `python3 -I -u - watch` over ssh, so nothing is
 installed on the remote machine and the agent always matches the app. It ends
 by itself once the ssh connection goes away, because its next write fails.
 
-`watch` and `--once` are read-only. They report token counts, model names, tool
-names, the file name a worker last touched and a short title per session or
-worker. They never report message bodies, commands or other tool inputs, or
-anything from credential files: those are read only to tell whether a key is set.
+`watch` and `--once` are read-only. They report token counts per day and model
+(see docs/FLEET-USAGE.md), model names, tool names, the file name a worker last
+touched, a short title per session or worker, the OS account name and, from
+`~/.claude.json`, the Claude account's email, plan name and organization name.
+Nothing else from that file is reported. They never report message bodies,
+commands or other tool inputs, or anything from credential files: those are read
+only to tell whether a key is set.
 
 `cancel RUN_ID` stops one running mm-worker task and prints one JSON line.
 
@@ -27,6 +30,7 @@ import glob
 import json
 import os
 import platform
+import pwd
 import re
 import select
 import signal
@@ -35,7 +39,7 @@ import subprocess
 import sys
 import time
 
-AGENT_VERSION = 4
+AGENT_VERSION = 5
 SCAN_INTERVAL = 2.0  # how often known session files are checked for growth
 WALK_INTERVAL = 15.0  # how often the tree is walked for new session files
 HEARTBEAT = 5.0  # longest gap between snapshots, so CPU and temperature stay current
@@ -50,6 +54,11 @@ FINISHED_JOB_WINDOW = 3600  # how long a finished worker stays listed
 JOB_WINDOW = 7 * 86400  # older job folders are ignored without being read
 TITLE_LENGTH = 60
 READ_CHUNK = 1 << 20
+HISTORY_DAYS = 29  # past days reported in usageHistory, today not included
+HISTORY_PASS_BYTES = 16 << 20  # most the past-days scan reads in one pass of the main loop
+HISTORY_INTERVAL = 15.0  # least time between two usageHistory sent while the first scan runs
+ACCOUNT_INTERVAL = 60.0  # how often ~/.claude.json is checked
+ACCOUNT_LIMIT = 32 << 20  # a bigger ~/.claude.json is not read
 
 # Where Linux publishes CPU and sensor data. Tests point these at a fixture.
 PROC_STAT = "/proc/stat"
@@ -61,6 +70,7 @@ LINUX_CPU_LABELS = ("tctl", "tdie", "package id 0")
 
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(HOME, ".claude", "projects")
+CLAUDE_CONFIG = os.path.join(HOME, ".claude.json")
 WORKER_STATE = os.path.join(HOME, ".cache", "mm-worker")
 DISPATCHER = os.path.join(HOME, ".local", "bin", "mm-worker")
 RULES_DIR = os.path.join(HOME, ".config", "mm-worker")
@@ -252,7 +262,7 @@ class SessionLog:
         self.messages[ident] = {
             "session": known["session"] if known else session_id,
             "model": model or "unknown",
-            "when": known["when"] if known and known["when"] else when,
+            "when": _earliest(known["when"] if known else None, when),
             "input": _count(usage, "input_tokens"),
             "output": _count(usage, "output_tokens"),
             "cacheRead": _count(usage, "cache_read_input_tokens"),
@@ -268,14 +278,18 @@ class SessionLog:
             if state["mtime"] and state["mtime"] < midnight:
                 del self.files[path]
 
-    def report(self, now):
+    def report(self, now, history=None):
+        """Sessions and today's tokens by model. With a history, a message it has
+        seen on an earlier day is that day's, so it is never counted twice."""
         midnight = local_midnight(now)
+        today = local_day(now)
         by_session = {}
         by_model = {}
-        for record in self.messages.values():
+        for ident, record in self.messages.items():
             bucket = by_session.setdefault(record["session"], _empty_usage())
             _add(bucket, record)
-            if record["when"] is not None and record["when"] >= midnight:
+            if (record["when"] is not None and record["when"] >= midnight
+                    and (history is None or not history.earlier(ident, today))):
                 _add(by_model.setdefault(record["model"], _empty_usage()), record)
         listed = []
         for ident, meta in self.sessions.items():
@@ -295,6 +309,251 @@ class SessionLog:
         self.usage_by_session = by_session
         listed.sort(key=lambda item: item["idleSeconds"])
         return listed[:MAX_SESSIONS], by_model
+
+
+def _earliest(first, second):
+    if first is None:
+        return second
+    return first if second is None else min(first, second)
+
+
+def local_day(epoch):
+    """The local date as 2026-11-01. Interned, as many records share each day."""
+    return sys.intern(time.strftime("%Y-%m-%d", time.localtime(epoch)))
+
+
+def _days_back(now, days, hour):
+    t = time.localtime(now)
+    return time.mktime((t.tm_year, t.tm_mon, t.tm_mday - days, hour, 0, 0, 0, 0, -1))
+
+
+class UsageHistory:
+    """Tokens per local day and model for the HISTORY_DAYS days before today.
+
+    Separate from SessionLog, which reads only today's files and must stay
+    quick. The first scan reads every file touched within the window, at most
+    HISTORY_PASS_BYTES per step, so a long log never holds up a live snapshot.
+    Later steps read only what files gained.
+
+    Today's messages are kept too, so that at midnight they move into the past
+    days without a rescan. Days before yesterday keep only totals and the ids
+    of their messages, enough to ignore a repeat: a message still being
+    streamed can only be from yesterday or today.
+    """
+
+    def __init__(self):
+        self.files = {}  # path -> {"offset", "pending", "mtime"}
+        self.queue = []  # paths with unread bytes, oldest file first
+        self.detail = {}  # message id -> (day, model, input, output, cacheRead, cacheWrite)
+        self.totals = {}  # day -> model -> [input, output, cacheRead, cacheWrite], for compacted days
+        self.seen = {}  # day -> ids of its messages, for compacted days
+        self.walked = False
+        self.last_walk = 0.0
+        self.complete = False
+        self.total_bytes = 0  # what the first scan has to read
+        self.read_bytes = 0
+        self.today = None
+        self.changed = True
+        self.days = None
+        self.sent = None
+        self.sent_at = None
+
+    def _set_day(self, now):
+        today = local_day(now)
+        if today == self.today:
+            return
+        self.today = today
+        self.start = local_day(_days_back(now, HISTORY_DAYS, 12))
+        self.start_time = _days_back(now, HISTORY_DAYS, 0)
+        self.yesterday = local_day(_days_back(now, 1, 12))
+        for day in [day for day in self.totals if day < self.start]:
+            del self.totals[day]
+            self.seen.pop(day, None)
+        for path in [path for path, state in self.files.items() if state["mtime"] < self.start_time]:
+            del self.files[path]
+        self.queue = [path for path in self.queue if path in self.files]
+        self._compact()
+        self.changed = True
+
+    def _compact(self):
+        """Fold the detail of days before yesterday into totals, once the
+        first scan has seen every copy of those messages."""
+        if not self.complete:
+            return
+        for ident, record in list(self.detail.items()):
+            if record[0] < self.yesterday:
+                del self.detail[ident]
+                if record[0] >= self.start:
+                    self._fold(ident, record)
+
+    def _fold(self, ident, record):
+        _add_counts(self.totals, record[0], record[1], record[2:])
+        self.seen.setdefault(record[0], set()).add(ident)
+
+    def _compacted(self, ident):
+        return any(ident in ids for ids in self.seen.values())
+
+    def earlier(self, ident, today):
+        """Whether this message belongs to a day before today."""
+        record = self.detail.get(ident)
+        if record is not None:
+            return record[0] < today
+        return self._compacted(ident)
+
+    def _walk(self, now):
+        self.last_walk = now
+        found = []
+        for folder, _, names in os.walk(PROJECTS):
+            for name in names:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(folder, name)
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                if stat.st_mtime < self.start_time:
+                    continue  # nothing in it can be in the window, so it is not opened
+                state = self.files.setdefault(path, {"offset": 0, "pending": b"", "mtime": 0.0})
+                state["mtime"] = stat.st_mtime
+                if stat.st_size < state["offset"]:
+                    state.update(offset=0, pending=b"")  # rewritten; repeats count once
+                if stat.st_size > state["offset"]:
+                    found.append((stat.st_mtime, path, stat.st_size - state["offset"]))
+        # Older files first, so the copy of a message in a resumed session is read last.
+        found.sort()
+        queued = set(self.queue)
+        self.queue.extend(path for _, path, _ in found if path not in queued)
+        if not self.walked:
+            self.walked = True
+            self.total_bytes = sum(size for _, _, size in found)
+
+    def step(self, now, budget=None):
+        """One pass of the main loop: read at most budget bytes, all there is if 0."""
+        self._set_day(now)
+        if budget is None:
+            budget = HISTORY_PASS_BYTES
+        if not self.queue and (not self.walked or now - self.last_walk >= WALK_INTERVAL):
+            self._walk(now)
+        left = budget or None
+        while self.queue and (left is None or left > 0):
+            used, finished = self._read(self.files[self.queue[0]], self.queue[0], left)
+            if left is not None:
+                left -= used
+            if finished:
+                self.queue.pop(0)
+        if not self.complete and self.walked and not self.queue:
+            self.complete = True
+            self.changed = True
+            self._compact()
+
+    def finish(self, now):
+        """Read everything there is, as --once does."""
+        while not self.complete:
+            self.step(now, 0)
+
+    def _read(self, state, path, limit):
+        """(bytes read, whether the file is done)."""
+        used = 0
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(state["offset"])
+                while limit is None or used < limit:
+                    chunk = handle.read(READ_CHUNK if limit is None else min(READ_CHUNK, limit - used))
+                    if not chunk:
+                        return used, True
+                    used += len(chunk)
+                    state["offset"] += len(chunk)
+                    if not self.complete:
+                        self.read_bytes += len(chunk)
+                    lines = (state["pending"] + chunk).split(b"\n")
+                    state["pending"] = lines.pop()
+                    for line in lines:
+                        self._line(line)
+        except OSError:
+            return used, True
+        return used, False
+
+    def _line(self, line):
+        if b'"usage"' not in line:
+            return
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            return
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            return
+        usage = message.get("usage")
+        ident = message.get("id")
+        model = message.get("model")
+        when = parse_timestamp(entry.get("timestamp"))
+        if not isinstance(usage, dict) or not ident or model == "<synthetic>" or when is None:
+            return
+        day = local_day(when)
+        known = self.detail.get(ident)
+        if known is not None:
+            day = min(day, known[0])
+        elif self._compacted(ident):
+            return  # counted already, and finished long ago
+        elif day < self.start:
+            return  # outside the window
+        record = (day, sys.intern(model if isinstance(model, str) and model else "unknown"),
+                  _count(usage, "input_tokens"), _count(usage, "output_tokens"),
+                  _count(usage, "cache_read_input_tokens"), _count(usage, "cache_creation_input_tokens"))
+        if record == known:
+            return
+        if known is None and self.complete and day < self.yesterday:
+            self._fold(ident, record)
+        else:
+            self.detail[ident] = record
+        if day < self.today:
+            self.changed = True
+
+    def report(self, now):
+        """The usageHistory field, whether or not it is news."""
+        self._set_day(now)
+        if self.changed or self.days is None:
+            self.changed = False
+            days = {}
+            for day, models in self.totals.items():
+                for model, counts in models.items():
+                    _add_counts(days, day, model, counts)
+            for record in self.detail.values():
+                if self.start <= record[0] < self.today:
+                    _add_counts(days, record[0], record[1], record[2:])
+            self.days = {}
+            for day in sorted(days):
+                models = {model: dict(zip(("input", "output", "cacheRead", "cacheWrite"), counts))
+                          for model, counts in sorted(days[day].items()) if any(counts)}
+                if models:
+                    self.days[day] = models
+        if self.complete:
+            progress = 1.0
+        else:
+            progress = min(1.0, self.read_bytes / self.total_bytes) if self.total_bytes else 0.0
+        return {"complete": self.complete, "progress": round(progress, 3),
+                "days": json.loads(json.dumps(self.days))}  # a copy, so callers can't change the cache
+
+    def news(self, now):
+        """The usageHistory field if it changed since it was last sent, else None.
+        While the first scan runs, at most one every HISTORY_INTERVAL."""
+        if not self.complete and self.sent_at is not None and now - self.sent_at < HISTORY_INTERVAL:
+            return None
+        report = self.report(now)
+        body = json.dumps(report, sort_keys=True)
+        if body == self.sent:
+            return None
+        self.sent, self.sent_at = body, now
+        return report
+
+
+def _add_counts(days, day, model, counts):
+    bucket = days.setdefault(day, {}).setdefault(model, [0, 0, 0, 0])
+    for index in range(4):
+        bucket[index] += counts[index]
 
 
 def _count(usage, key):
@@ -1285,6 +1544,64 @@ class Vitals:
         return {"cpuPercent": self.cpu.percent(), "temperature": self.temperature}
 
 
+def _text_or_none(value):
+    return value if isinstance(value, str) and value else None
+
+
+def read_claude_account():
+    """Email, plan and organization from oauthAccount in ~/.claude.json, and
+    nothing else from it: the file can hold keys and tokens. None means not
+    known, as a machine can also log in with a token."""
+    try:
+        if os.path.getsize(CLAUDE_CONFIG) > ACCOUNT_LIMIT:
+            return None
+        with open(CLAUDE_CONFIG, "rb") as handle:
+            data = handle.read(ACCOUNT_LIMIT + 1)
+        if len(data) > ACCOUNT_LIMIT:
+            return None
+        account = json.loads(data.decode("utf-8")).get("oauthAccount")
+    except (OSError, ValueError, RecursionError, AttributeError):
+        return None
+    if not isinstance(account, dict) or not _text_or_none(account.get("emailAddress")):
+        return None
+    return {
+        "email": account["emailAddress"],
+        "plan": _text_or_none(account.get("planDisplayName")),
+        "organization": _text_or_none(account.get("organizationName")),
+    }
+
+
+class ClaudeAccount:
+    """read_claude_account at most every ACCOUNT_INTERVAL, and only parsed
+    again when the file changed, as it can be large."""
+
+    def __init__(self):
+        self.checked_at = None
+        self.stamp = None
+        self.account = None
+
+    def read(self, now):
+        if self.checked_at is not None and now - self.checked_at < ACCOUNT_INTERVAL:
+            return self.account
+        self.checked_at = now
+        try:
+            stat = os.stat(CLAUDE_CONFIG)
+            stamp = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            stamp = None
+        if stamp is None or stamp != self.stamp:
+            self.stamp = stamp
+            self.account = read_claude_account() if stamp else None
+        return self.account
+
+
+def os_user():
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        return os.environ.get("USER") or os.environ.get("LOGNAME") or os.path.basename(HOME)
+
+
 def host_info():
     try:
         load = os.getloadavg()[0]
@@ -1292,6 +1609,7 @@ def host_info():
         load = None
     return {
         "hostname": socket.gethostname().split(".")[0],
+        "user": os_user(),
         "system": platform.system(),
         "machine": platform.machine(),
         "cpus": os.cpu_count() or 0,
@@ -1299,8 +1617,9 @@ def host_info():
     }
 
 
-def snapshot(log, now, vitals=None, dispatcher=None):
-    sessions, models = log.report(now)
+def snapshot(log, now, vitals=None, dispatcher=None, history=None, account=None):
+    """One snapshot. usageHistory is in it only when it is news (see UsageHistory.news)."""
+    sessions, models = log.report(now, history)
     workers = (local_workers(now, log.streams, log.usage_by_session)
                + remote_jobs(now, log.streams, log.usage_by_session))
     live = {worker.pop("stream") for worker in workers if "stream" in worker}
@@ -1308,14 +1627,19 @@ def snapshot(log, now, vitals=None, dispatcher=None):
     host = host_info()
     if vitals is not None:
         host.update(vitals.read(now))
-    return {
+    report = {
         "agentVersion": AGENT_VERSION,
         "host": host,
+        "claudeAccount": (account if account is not None else ClaudeAccount()).read(now),
         "sessions": sessions,
         "todayByModel": models,
         "workers": workers,
         "dispatcher": (dispatcher if dispatcher is not None else Dispatcher()).read(now),
     }
+    news = history.news(now) if history is not None else None
+    if news is not None:
+        report["usageHistory"] = news
+    return report
 
 
 def main(argv):
@@ -1331,8 +1655,10 @@ def main(argv):
         except OSError:
             pass
     log = SessionLog()
+    history = UsageHistory()
     vitals = Vitals()
     dispatcher = Dispatcher()
+    account = ClaudeAccount()
     time.sleep(0.25)  # so the first CPU reading has an interval to measure
     once = "--once" in argv
     last_body = None
@@ -1340,10 +1666,12 @@ def main(argv):
     while True:
         now = time.time()
         log.scan(now)
-        report = snapshot(log, now, vitals, dispatcher)
+        if once:
+            history.finish(now)
+        report = snapshot(log, now, vitals, dispatcher, history, account)
         # Ages and machine load change on every pass, so they don't count as news.
         body = json.dumps(_without_clock(report), sort_keys=True)
-        if once or body != last_body or now - last_sent >= HEARTBEAT:
+        if once or "usageHistory" in report or body != last_body or now - last_sent >= HEARTBEAT:
             try:
                 sys.stdout.write(json.dumps(report, separators=(",", ":")) + "\n")
                 sys.stdout.flush()
@@ -1352,11 +1680,15 @@ def main(argv):
             last_body, last_sent = body, now
         if once:
             return 0
+        # After the snapshot is out, so a long scan only ever delays the next one by a pass.
+        history.step(time.time())
         time.sleep(SCAN_INTERVAL)
 
 
 def _without_clock(report):
     stable = dict(report)
+    # Sent only when it is news already, and left out of most snapshots.
+    stable.pop("usageHistory", None)
     stable["host"] = {k: v for k, v in report["host"].items() if k not in ("load", "cpuPercent", "temperature")}
     stable["sessions"] = [{k: v for k, v in s.items() if k != "idleSeconds"} for s in report["sessions"]]
     stable["workers"] = [{k: v for k, v in w.items() if k not in ("elapsedSeconds", "idleSeconds")} for w in report["workers"]]

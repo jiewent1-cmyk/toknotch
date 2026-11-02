@@ -12,6 +12,8 @@ struct FleetSnapshot: Decodable, Equatable {
         var cpuPercent: Double?
         /// CPU temperature in °C. Nil where no sensor could be read.
         var temperature: Double?
+        /// The OS account running the agent. Absent from an older agent.
+        var user: String?
     }
 
     var agentVersion: Int
@@ -21,6 +23,10 @@ struct FleetSnapshot: Decodable, Equatable {
     var workers: [FleetWorker]
     /// This machine's dispatcher and rules. Absent from an older agent.
     var dispatcher: FleetDispatcher?
+    /// Who this machine's Claude tokens are billed to. Nil means not known.
+    var claudeAccount: FleetClaudeAccount?
+    /// Past days, sent only when they change. See `FleetUsageRecord`.
+    var usageHistory: FleetUsageHistory?
 
     /// Today's tokens across every model.
     var todayTotal: Int64 { todayByModel.values.reduce(0) { $0 + $1.total } }
@@ -55,7 +61,7 @@ enum FleetVitalLevel: Equatable {
     }
 }
 
-struct FleetUsage: Decodable, Equatable {
+struct FleetUsage: Codable, Equatable {
     var input: Int64
     var output: Int64
     var cacheRead: Int64
@@ -217,10 +223,12 @@ enum FleetConfig {
 extension FleetSnapshot {
     private enum CodingKeys: String, CodingKey {
         case agentVersion, host, sessions, todayByModel, workers, dispatcher
+        case claudeAccount, usageHistory
     }
 
-    /// A `dispatcher` that can't be read is treated as absent: the rest of the
-    /// report is still good, and losing a whole line would look like a dead link.
+    /// A `dispatcher`, `claudeAccount` or `usageHistory` that can't be read is
+    /// treated as absent: the rest of the report is still good, and losing a
+    /// whole line would look like a dead link.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         agentVersion = try container.decode(Int.self, forKey: .agentVersion)
@@ -229,6 +237,8 @@ extension FleetSnapshot {
         todayByModel = try container.decode([String: FleetUsage].self, forKey: .todayByModel)
         workers = try container.decode([FleetWorker].self, forKey: .workers)
         dispatcher = (try? container.decodeIfPresent(FleetDispatcher.self, forKey: .dispatcher)) ?? nil
+        claudeAccount = (try? container.decodeIfPresent(FleetClaudeAccount.self, forKey: .claudeAccount)) ?? nil
+        usageHistory = (try? container.decodeIfPresent(FleetUsageHistory.self, forKey: .usageHistory)) ?? nil
     }
 
     /// Decodes one output line. Nil for anything else ssh or a shell profile

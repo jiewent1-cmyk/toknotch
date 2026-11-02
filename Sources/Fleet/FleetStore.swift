@@ -8,6 +8,9 @@ struct FleetDeviceState: Identifiable, Equatable {
     /// The last report. Kept while offline, marked stale by `link`.
     var snapshot: FleetSnapshot?
     var updatedAt: Date?
+    /// What the Usage page knows about this device's tokens. Outlives the
+    /// snapshot, as it is cached on disk and most snapshots carry no history.
+    var usage: FleetUsageRecord?
 
     var id: String { device.id }
     var isLive: Bool {
@@ -51,29 +54,46 @@ final class FleetStore: ObservableObject {
     /// Nil for a fixture, which has no file to write to.
     private let configPath: String?
     private let isFixture: Bool
+    /// Nil for a fixture, which keeps nothing.
+    private let usageCachePath: String?
+    /// What the cache file holds for each device, and when that was written.
+    private var usageSaved: [String: FleetUsageRecord] = [:]
+    private var usageSavedAt: [String: Date] = [:]
 
     init(devices: [FleetDevice] = FleetConfig.load(),
          script: Data? = FleetStore.bundledScript(),
          dispatcherFile: Data? = FleetStore.bundledDispatcher(),
-         configPath: String = FleetConfig.path) {
-        self.devices = devices.map { FleetDeviceState(device: $0) }
+         configPath: String = FleetConfig.path,
+         usageCachePath: String = FleetUsageCache.path) {
+        let cached = FleetUsageCache.load(from: usageCachePath)
+        self.devices = devices.map { FleetDeviceState(device: $0, usage: cached[$0.id]) }
         self.script = script
         self.dispatcherFile = dispatcherFile
         self.configPath = configPath
         accountLimits = FleetConfig.loadAccountLimits(from: configPath)
         isFixture = false
+        self.usageCachePath = usageCachePath
+        usageSaved = cached
     }
 
     /// Already holds the given states and makes no connections. For previews and
     /// rendering checks. Giving a script and a file shows the controls as enabled.
     init(fixture: [FleetDeviceState], script: Data? = nil, dispatcherFile: Data? = nil,
          accountLimits: [String: Int] = [:]) {
-        devices = fixture
+        // A fixture that gives only snapshots still shows on the Usage page.
+        devices = fixture.map { state in
+            var state = state
+            if state.usage == nil, let snapshot = state.snapshot {
+                state.usage = FleetUsageRecord.updated(nil, with: snapshot, at: state.updatedAt ?? Date())
+            }
+            return state
+        }
         self.script = script
         self.dispatcherFile = dispatcherFile
         configPath = nil
         self.accountLimits = accountLimits
         isFixture = true
+        usageCachePath = nil
         for state in fixture {
             if let dispatcher = state.snapshot?.dispatcher { receive(dispatcher, for: state.id) }
         }
@@ -100,10 +120,13 @@ final class FleetStore: ObservableObject {
             }
             connection.onSnapshot = { [weak self] snapshot in
                 MainActor.assumeIsolated {
+                    let now = Date()
                     self?.update(id) {
                         $0.snapshot = snapshot
-                        $0.updatedAt = Date()
+                        $0.updatedAt = now
+                        $0.usage = FleetUsageRecord.updated($0.usage, with: snapshot, at: now)
                     }
+                    self?.saveUsage(now: now)
                     self?.settleCancelling(device: id, snapshot: snapshot)
                     if let dispatcher = snapshot.dispatcher { self?.receive(dispatcher, for: id) }
                 }
@@ -118,6 +141,38 @@ final class FleetStore: ObservableObject {
         guard users == 0 else { return }
         connections.values.forEach { $0.stop() }
         connections.removeAll()
+        // Whatever the last minute held, so a reopened window starts from it.
+        saveUsage(now: Date(), closing: true)
+    }
+
+    // MARK: Usage cache
+
+    /// Writes the records that are due. One not yet due keeps what the file
+    /// last held for it, so no device is written more than once a minute.
+    private func saveUsage(now: Date, closing: Bool = false) {
+        guard let usageCachePath else { return }
+        var records = usageSaved
+        var written: [String] = []
+        for state in devices {
+            guard let record = state.usage, record != usageSaved[state.id] else { continue }
+            if closing || FleetUsageCache.needsWrite(record, saved: usageSaved[state.id],
+                                                     savedAt: usageSavedAt[state.id],
+                                                     now: now, calendar: .current) {
+                records[state.id] = record
+                written.append(state.id)
+            }
+        }
+        guard !written.isEmpty else { return }
+        // A device taken out of fleet.json leaves the cache with it.
+        let ids = Set(devices.map(\.id))
+        records = records.filter { ids.contains($0.key) }
+        do {
+            try FleetUsageCache.save(records, to: usageCachePath)
+        } catch {
+            return
+        }
+        usageSaved = records
+        for id in written { usageSavedAt[id] = now }
     }
 
     // MARK: Cancelling
