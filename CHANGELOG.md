@@ -7,6 +7,18 @@ All notable changes to TokNotch are recorded here. The format follows
 The same notes, in the app's own words and in your language, appear in the
 What's New sheet after an update.
 
+## [Unreleased]
+
+### Fixed
+
+- **Fleet quit the whole app when a machine was unreachable.** Away from home,
+  the first alias of a machine (its LAN address) fails and ssh exits without
+  reading its input. The Fleet agent had grown to 65,914 bytes, past the 65,536
+  a macOS pipe holds, so the app was still writing it when ssh quit, and the
+  SIGPIPE ended TokNotch without a crash report. Every pipe that feeds a child
+  process now reports a write error instead, and Fleet moves on to the next
+  alias, such as NetBird.
+
 ## [1.3.1]
 
 DeepSeek Harness usage counts again.

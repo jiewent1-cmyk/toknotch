@@ -29,6 +29,15 @@ final class FleetTests: XCTestCase {
         XCTAssertTrue(worker.isCancellableHere)
     }
 
+    /// ssh quits without reading when a host is unreachable, and the agent is larger
+    /// than a pipe holds. Writing to it must fail, not end the app with a SIGPIPE.
+    func testInputPipesReportAWriteErrorInsteadOfSIGPIPE() {
+        let pipe = FleetConnection.inputPipe()
+        XCTAssertEqual(fcntl(pipe.fileHandleForWriting.fileDescriptor, F_GETNOSIGPIPE), 1)
+        try? pipe.fileHandleForReading.close()
+        XCTAssertThrowsError(try pipe.fileHandleForWriting.write(contentsOf: Data([0])))
+    }
+
     /// One sent elsewhere is stopped on the machine running it; finished ones are done.
     func testOnlyRunningLocalWorkersCanBeCancelledHere() throws {
         let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: Data(sample.utf8)))

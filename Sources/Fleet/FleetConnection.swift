@@ -98,6 +98,16 @@ final class FleetConnection: @unchecked Sendable {
         }
     }
 
+    /// A pipe for feeding a child process. A child that dies early, as ssh does
+    /// when a host is unreachable, must give a write error, not a SIGPIPE that takes
+    /// the whole app with it. The agent is larger than a pipe holds, so the write is
+    /// still in progress when ssh gives up.
+    static func inputPipe() -> Pipe {
+        let pipe = Pipe()
+        _ = fcntl(pipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        return pipe
+    }
+
     /// The command that runs the agent. Pure, so it can be tested.
     static func command(for device: FleetDevice, alias: String?,
                         action: [String] = ["watch"]) -> (path: String, arguments: [String]) {
@@ -156,7 +166,7 @@ final class FleetConnection: @unchecked Sendable {
                 environment["HOME"] = NSHomeDirectory()
                 environment["PATH"] = TokscaleCLI.searchPath
                 process.environment = environment
-                let input = Pipe(), output = Pipe()
+                let input = inputPipe(), output = Pipe()
                 process.standardInput = input
                 process.standardOutput = output
                 process.standardError = FileHandle.nullDevice
@@ -297,13 +307,10 @@ final class FleetConnection: @unchecked Sendable {
                 environment["HOME"] = NSHomeDirectory()
                 environment["PATH"] = TokscaleCLI.searchPath
                 process.environment = environment
-                let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
+                let stdin = inputPipe(), stdout = Pipe(), stderr = Pipe()
                 process.standardInput = stdin
                 process.standardOutput = stdout
                 process.standardError = stderr
-                // A command that dies early must give a write error, not a SIGPIPE
-                // that takes the whole app with it.
-                _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
 
                 let state = CommandState()
                 do {
@@ -366,7 +373,7 @@ final class FleetConnection: @unchecked Sendable {
         environment["PATH"] = TokscaleCLI.searchPath
         process.environment = environment
 
-        let input = Pipe()
+        let input = Self.inputPipe()
         let output = Pipe()
         let errors = Pipe()
         process.standardInput = input
