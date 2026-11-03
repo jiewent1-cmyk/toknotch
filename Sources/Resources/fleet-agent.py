@@ -27,6 +27,7 @@ import base64
 import ctypes
 import fcntl
 import glob
+import http.client
 import json
 import os
 import platform
@@ -38,6 +39,9 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 AGENT_VERSION = 5
 SCAN_INTERVAL = 2.0  # how often known session files are checked for growth
@@ -88,6 +92,37 @@ MODELS = {
     "qwen": ("glm", "max", "flash", "lite", "ds"),
 }
 LEVELS = ("simple", "normal", "hard")
+
+# Besides the short names above, a rule may name a model as the provider's own
+# API does. The prefix keeps one provider's model off another, and keeps a key
+# pasted into a rules file from passing as a model.
+MODEL_PREFIXES = {
+    "minimax": ("minimax-",),
+    "zhipu": ("glm-",),
+    "claude": ("claude-",),
+    "qwen": ("qwen", "glm-", "deepseek-"),
+}
+FULL_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}")
+
+
+def is_full_model_name(provider, model):
+    return (isinstance(model, str) and FULL_MODEL_NAME.fullmatch(model) is not None
+            and model.lower().startswith(MODEL_PREFIXES[provider]))
+
+
+# The first mm-worker that accepts full model names in its rules. An older one
+# would call the file invalid and silently go back to its defaults.
+FULL_NAMES_DISPATCHER = 2
+
+# Where each provider lists its models: its host variable, and the path below it.
+# Claude isn't here, as a subscription has no key this could ask with.
+MODEL_LISTS = {
+    "minimax": ("MINIMAX_API_HOST", "/anthropic/v1/models"),
+    "zhipu": ("ZHIPU_API_HOST", "/v1/models"),
+    "qwen": ("QWEN_API_HOST", "/v1/models"),
+}
+MODEL_LIST_TIMEOUT = 10
+MODEL_LIST_PAGES = 5
 
 # Kept equal to the copy in mm-worker.py and to docs/FLEET-RULES.md.
 DEFAULT_RULES = {
@@ -986,8 +1021,9 @@ def rules_error(rules):
         for name in sorted(choice):
             if name not in providers:
                 return "%s names %s, which is not in providers" % (field, _quote(name))
-            if choice[name] not in MODELS[name]:
-                return "%s.%s must be one of %s" % (field, name, ", ".join(MODELS[name]))
+            if choice[name] not in MODELS[name] and not is_full_model_name(name, choice[name]):
+                return "%s.%s must be one of %s, or a %s model's full name" % (
+                    field, name, ", ".join(MODELS[name]), name)
     defaults = rules["defaults"]
     if not isinstance(defaults, dict):
         return "defaults must be an object"
@@ -1062,9 +1098,12 @@ ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
 
 def _key_value(provider):
-    """The provider's API key, or "". Callers only test it or hide it: it is
-    never stored, reported or logged."""
-    variable = API_KEYS.get(provider)
+    """The provider's API key, or "". Callers test it, hide it or send it to the
+    provider's own host: it is never stored, reported or logged."""
+    return _env_value(provider, API_KEYS.get(provider))
+
+
+def _env_value(provider, variable):
     text = _read_text(os.path.join(HOME, ".config", provider, "env"), 1 << 16) if variable else None
     value = ""
     for line in (text or "").lstrip("\ufeff").splitlines():
@@ -1259,7 +1298,14 @@ def rules_set(encoded, expected):
     error = rules_error(rules)
     if error:
         return {"ok": False, "error": error}
+    if uses_full_names(rules) and dispatcher_version()[1] < FULL_NAMES_DISPATCHER:
+        return {"ok": False, "error": "this machine's mm-worker is too old for these models: update it first"}
     return write_rules(rules, int(expected))
+
+
+def uses_full_names(rules):
+    return any(model not in MODELS[name] for choice in rules["levels"].values()
+               for name, model in choice.items())
 
 
 def rules_reset(expected):
@@ -1276,6 +1322,56 @@ def rules_command(argv):
         if argv[0] == "rules-reset" and len(argv) == 2:
             return rules_reset(argv[1])
         return {"ok": False, "error": RULES_USAGE}
+    except Exception as error:  # a bug here must still answer
+        return {"ok": False, "error": "unexpected " + type(error).__name__}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A key goes to the host in the provider's env file, and nowhere else."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _model_page(url, key):
+    request = urllib.request.Request(url, headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(request, timeout=MODEL_LIST_TIMEOUT) as response:
+        return json.loads(response.read(1 << 20).decode("utf-8"))
+
+
+def list_models(provider):
+    """{"models": [...]} as the provider's API lists them, or {"error": "..."}.
+    An error never repeats what the server said, so nothing odd reaches the app."""
+    variable, path = MODEL_LISTS[provider]
+    host = _env_value(provider, variable).rstrip("/")
+    if not host.startswith("https://"):
+        return {"error": "no https host configured"}
+    key, models, after = _key_value(provider), [], None
+    try:
+        for _ in range(MODEL_LIST_PAGES):
+            query = {"limit": 1000}
+            if after:
+                query["after_id"] = after
+            page = _model_page(host + path + "?" + urllib.parse.urlencode(query), key)
+            for entry in page["data"]:
+                name = entry.get("id") if isinstance(entry, dict) else None
+                if is_full_model_name(provider, name) and name not in models:
+                    models.append(name)
+            after = page.get("last_id") or page.get("lastId")
+            if not (page.get("has_more") or page.get("hasMore")) or not after:
+                break
+    except urllib.error.HTTPError as error:
+        return {"error": "HTTP %d" % error.code}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, http.client.HTTPException):
+        return {"error": "no usable answer"}
+    return {"models": models}
+
+
+def models_command():
+    """One answer for every input, never a traceback: the app reads one line."""
+    try:
+        return {"ok": True, "providers": {name: list_models(name) for name in MODEL_LISTS if _key_value(name)}}
     except Exception as error:  # a bug here must still answer
         return {"ok": False, "error": "unexpected " + type(error).__name__}
 
@@ -1648,6 +1744,9 @@ def main(argv):
         return 0
     if argv[:1] in (["rules-set"], ["rules-reset"]):
         print(json.dumps(rules_command(argv)))
+        return 0
+    if argv[:1] == ["models"]:
+        print(json.dumps(models_command()))
         return 0
     if hasattr(os, "nice"):
         try:

@@ -28,7 +28,10 @@ struct FleetRules: Codable, Equatable {
     var defaults: Defaults
 
     /// The `MM_WORKER_VERSION` of the `mm-worker.py` in this app's bundle.
-    static let bundledDispatcherVersion = 1
+    static let bundledDispatcherVersion = 2
+    /// The first `mm-worker` that accepts full model names. An older one would
+    /// call such rules invalid and silently go back to its defaults.
+    static let fullNamesDispatcherVersion = 2
 
     static let balanceProportional = "proportional"
     static let balancePriority = "priority"
@@ -44,7 +47,8 @@ struct FleetRules: Codable, Equatable {
         var displayName: String
     }
 
-    /// The models each provider may be given, in menu order.
+    /// The short names every `mm-worker` knows, in menu order. Other models go by
+    /// their full names, see `isFullModelName` and `menuModels`.
     static let allowedModels: [String: [Model]] = [
         "minimax": [
             Model(id: "m3", displayName: "MiniMax-M3"),
@@ -155,7 +159,7 @@ extension FleetRules {
             for provider in models.keys.sorted() {
                 if providers[provider] == nil {
                     issues.append(.levelProvider(level: level, provider: provider))
-                } else if !(Self.allowedModels[provider] ?? []).contains(where: { $0.id == models[provider] }) {
+                } else if !Self.isAllowedModel(models[provider] ?? "", provider: provider) {
                     issues.append(.model(level: level, provider: provider))
                 }
             }
@@ -222,6 +226,59 @@ extension FleetRules {
     mutating func setSlots(_ slots: Int, for provider: String) {
         ensureProvider(provider)
         providers[provider]?.slots = slots
+    }
+
+    /// Kept equal to `MODEL_PREFIXES` in `mm-worker.py` and `fleet-agent.py`.
+    private static let modelPrefixes: [String: [String]] = [
+        "minimax": ["minimax-"],
+        "zhipu": ["glm-"],
+        "claude": ["claude-"],
+        "qwen": ["qwen", "glm-", "deepseek-"],
+    ]
+
+    /// A subscription has no key to ask with, so Claude's list can't come from
+    /// its API like the others.
+    static let knownFullModels: [String: [Model]] = [
+        "claude": [
+            Model(id: "claude-fable-5-1", displayName: "Fable 5.1"),
+            Model(id: "claude-sonnet-5-5", displayName: "Sonnet 5.5"),
+            Model(id: "claude-haiku-5-5", displayName: "Haiku 5.5"),
+        ],
+    ]
+
+    static func isFullModelName(_ name: String, provider: String) -> Bool {
+        guard name.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$", options: .regularExpression) != nil
+        else { return false }
+        let lowered = name.lowercased()
+        return (modelPrefixes[provider] ?? []).contains { lowered.hasPrefix($0) }
+    }
+
+    static func isAllowedModel(_ model: String, provider: String) -> Bool {
+        (allowedModels[provider] ?? []).contains { $0.id == model }
+            || isFullModelName(model, provider: provider)
+    }
+
+    /// What a model menu offers: the short names, then what else the provider
+    /// lists. A model that has two names shows once, under its short one. The
+    /// current choice is always there, or the menu would show it as blank.
+    static func menuModels(provider: String, listed: [String], current: String?,
+                           acceptsFullNames: Bool) -> [Model] {
+        var menu = allowedModels[provider] ?? []
+        func add(_ model: Model) {
+            let name = model.id.lowercased()
+            guard !menu.contains(where: { $0.id.lowercased() == name || $0.displayName.lowercased() == name })
+            else { return }
+            menu.append(model)
+        }
+        if acceptsFullNames {
+            (knownFullModels[provider] ?? []).forEach(add)
+            listed.filter { isFullModelName($0, provider: provider) }
+                .forEach { add(Model(id: $0, displayName: $0)) }
+        }
+        if let current, !menu.contains(where: { $0.id == current }) {
+            menu.append(Model(id: current, displayName: current))
+        }
+        return menu
     }
 
     func model(level: String, provider: String) -> String? { levels[level]?[provider] }

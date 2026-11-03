@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-MM_WORKER_VERSION = 1
+MM_WORKER_VERSION = 2
 
 # mm-worker: runs one non-interactive Claude Code task on one of several
 # providers, chosen by task level and load, and moves to the next provider when
@@ -34,8 +34,8 @@ usage: mm-worker [options] "prompt"
   -l, --level simple|normal|hard   task level (default normal, or simple with -m fast)
   -b, -P, --backend auto|minimax|zhipu|claude|qwen
                                    force a provider, even a disabled one (default auto)
-  -m, --mm-model m3|m27|fast       MiniMax model
-  -z, --zp-model flash             Zhipu model
+  -m, --mm-model m3|m27|fast|NAME  MiniMax model
+  -z, --zp-model flash|NAME        Zhipu model
   -q, --qw-model glm|max|flash|lite|ds
                                    Qwen endpoint model
   -c, --claude-model MODEL         Claude model (opus only for hard)
@@ -60,6 +60,23 @@ MODELS = {
     "claude": ("sonnet", "haiku", "claude-opus-5-5"),
     "qwen": ("glm", "max", "flash", "lite", "ds"),
 }
+
+# Besides the short names above, a rule may name a model as the provider's own
+# API does. The prefix keeps one provider's model off another, and keeps a key
+# pasted into a rules file from passing as a model.
+MODEL_PREFIXES = {
+    "minimax": ("minimax-",),
+    "zhipu": ("glm-",),
+    "claude": ("claude-",),
+    "qwen": ("qwen", "glm-", "deepseek-"),
+}
+FULL_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}")
+
+
+def is_full_model_name(provider, model):
+    return (isinstance(model, str) and FULL_MODEL_NAME.fullmatch(model) is not None
+            and model.lower().startswith(MODEL_PREFIXES[provider]))
+
 
 DEFAULT_RULES = {
     "version": 1,
@@ -88,7 +105,7 @@ LEVEL_FALLBACK = {
 }
 
 # Each provider maps Claude's model aliases to its own models (see provider_env),
-# so a model is chosen by passing the alias.
+# so a model is chosen by passing the alias. A full model name passes as it is.
 ALIASES = {
     "minimax": {"m3": "opus[1m]", "m27": "sonnet", "fast": "haiku"},
     "zhipu": {"flash": "sonnet"},
@@ -229,7 +246,7 @@ def validate_rules(rules):
         for name, model in models.items():
             if name not in providers:
                 return "levels.%s names unknown provider %s" % (level, name)
-            if model not in MODELS[name]:
+            if model not in MODELS[name] and not is_full_model_name(name, model):
                 return "levels.%s.%s: %s is not a %s model" % (level, name, model, name)
     error = _exact_keys(rules["defaults"], ("timeoutSeconds", "cooldownSeconds"), "defaults")
     if error:

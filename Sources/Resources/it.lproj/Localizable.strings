@@ -290,6 +290,11 @@
 "fleet.rules.issue.emptyLevel" = "%@ needs at least one provider.";
 "fleet.rules.issue.levelProvider" = "%1$@ names a provider that isn’t listed: %2$@.";
 "fleet.rules.issue.model" = "%1$@ uses a model %2$@ doesn’t offer.";
+"fleet.rules.models.source" = "Models beyond the short names come from each provider’s API. Claude’s are a built-in list.";
+"fleet.rules.models.failed" = "Couldn’t read the provider lists from this machine, so the menus show the built-in models.";
+"fleet.rules.models.providerFailed" = "%1$@’s list couldn’t be read (%2$@), so its menu shows the built-in models.";
+"fleet.rules.models.refresh" = "Refresh models";
+"fleet.rules.models.needsUpdate" = "Update this machine’s mm-worker to choose from every model its providers offer.";
 "fleet.rules.issue.timeout" = "The default timeout must be from %1$d to %2$d seconds.";
 "fleet.rules.issue.cooldown" = "The cooldown must be from %1$d to %2$d seconds.";
 "fleet.rules.failure.timedOut" = "The machine didn’t finish in time, so the result is unknown. Check the status here before trying again.";

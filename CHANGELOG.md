@@ -9,6 +9,14 @@ What's New sheet after an update.
 
 ## [Unreleased]
 
+### Added
+
+- **Dispatch rules can use every model a provider offers.** The model menus now
+  list what each machine's providers report through their APIs, read when the rules
+  are shown and on demand, instead of a fixed short list. Claude's menu is a
+  built-in list, as a subscription has no key to ask with. This needs `mm-worker`
+  version 2 on that machine, and the app offers the update.
+
 ### Fixed
 
 - **Fleet quit the whole app when a machine was unreachable.** Away from home,

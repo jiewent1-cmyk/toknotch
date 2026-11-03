@@ -828,6 +828,17 @@ class Rules(Base):
                 self.assertEqual(self.provider_of(done), "minimax")
                 self.assertIn("using the default rules", done.stderr.decode())
 
+    def test_a_full_model_name_reaches_claude_unchanged(self):
+        self.rules(lambda r: r["levels"]["normal"].update(minimax="MiniMax-M2.5"))
+        done = self.mw("x")
+        self.assertEqual(self.provider_of(done), "minimax")
+        self.assertNotIn("using the default rules", done.stderr.decode())
+        self.assertEqual(self.records("minimax")[-1]["argv"][:2], ["--model", "MiniMax-M2.5"])
+
+    def test_another_providers_model_is_invalid(self):
+        self.rules(lambda r: r["levels"]["normal"].update(minimax="glm-5.1"))
+        self.assertIn("using the default rules", self.mw("x").stderr.decode())
+
     def test_a_missing_file_is_silent(self):
         done = self.mw("x")
         self.assertNotIn("rules", done.stderr.decode())
@@ -1299,7 +1310,7 @@ class Source(unittest.TestCase):
     def test_header(self):
         lines = self.text.splitlines()
         self.assertEqual(lines[0], "#!/usr/bin/env python3")
-        self.assertEqual(lines[1], "MM_WORKER_VERSION = 1")
+        self.assertEqual(lines[1], "MM_WORKER_VERSION = 2")
 
     def test_python_3_9_grammar(self):
         ast.parse(self.text, feature_version=(3, 9))

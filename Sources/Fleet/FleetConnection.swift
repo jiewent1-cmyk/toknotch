@@ -23,6 +23,30 @@ enum FleetCommandFailure: Equatable {
     case unavailable
 }
 
+/// The models a machine's providers list through their APIs.
+struct FleetModelListing: Equatable {
+    var models: [String: [String]] = [:]
+    /// Why a provider's list could not be read.
+    var errors: [String: String] = [:]
+
+    /// From the last line of the agent's answer that parses. Nil if none does.
+    init?(output: Data) {
+        struct Entry: Decodable { var models: [String]?; var error: String? }
+        struct Answer: Decodable { var ok: Bool; var providers: [String: Entry]? }
+        let answer = String(decoding: output, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .reversed()
+            .lazy
+            .compactMap { try? JSONDecoder().decode(Answer.self, from: Data($0.utf8)) }
+            .first
+        guard let answer, answer.ok else { return nil }
+        for (provider, entry) in answer.providers ?? [:] {
+            if let list = entry.models { models[provider] = list }
+            if let error = entry.error { errors[provider] = error }
+        }
+    }
+}
+
 /// What a machine answered to a change of rules.
 enum FleetRulesAnswer: Equatable {
     case saved(revision: Int)
@@ -220,6 +244,8 @@ final class FleetConnection: @unchecked Sendable {
     }
 
     static let rulesTimeout: TimeInterval = 30
+    /// Three providers at 10 seconds each, and the connection.
+    static let modelsTimeout: TimeInterval = 45
     /// Roomy: stopping a transfer halfway is worse than waiting for a slow link.
     static let installTimeout: TimeInterval = 120
 
@@ -280,6 +306,13 @@ final class FleetConnection: @unchecked Sendable {
                                         action: rulesResetAction(expectedRevision: expectedRevision))
         return rulesAnswer(from: await run(path: path, arguments: arguments, input: script,
                                            timeout: rulesTimeout))
+    }
+
+    /// Asks the machine what its providers offer. Nil if it could not be asked.
+    static func listModels(on device: FleetDevice, alias: String?, script: Data) async -> FleetModelListing? {
+        let (path, arguments) = command(for: device, alias: alias, action: ["models"])
+        let result = await run(path: path, arguments: arguments, input: script, timeout: modelsTimeout)
+        return result.failure == nil ? FleetModelListing(output: result.output) : nil
     }
 
     /// Replaces the machine's `mm-worker` with `file`. Nil means it did.

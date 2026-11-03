@@ -69,6 +69,14 @@ Allowed models, by provider:
 | `claude` | `sonnet`, `haiku`, `claude-opus-5-5` | |
 | `qwen` | `glm`, `max`, `flash`, `lite`, `ds` | GLM-5.3, qwen3.8-max, qwen3.8-flash, qwen3.6-flash, DeepSeek-V4-Pro-0813 |
 
+A rule may also name any model by its full name, as the provider's API lists it:
+up to 80 letters, digits, `.`, `_`, `:` or `-`, starting with `MiniMax-`
+(`minimax`), `glm-` (`zhipu`), `claude-` (`claude`), or `qwen`, `glm-` or
+`deepseek-` (`qwen`), in any case. The prefix keeps one provider's model off another
+and keeps a pasted key from passing as a model. It needs `MM_WORKER_VERSION` 2, as
+an older dispatcher reads such a file as invalid. `mm-worker` passes the name to
+`claude --model` unchanged.
+
 Unknown keys are invalid, so a typo can't silently do nothing. An invalid file
 makes `mm-worker` warn on stderr and use the defaults. It never stops work.
 
@@ -118,7 +126,16 @@ New commands. Each prints one JSON line and exits 0, including on refusal:
   `expected-revision` (`"error": "conflict"`, `"revision": <current>`). A missing
   file has revision 0. The rules arrive as an argument because stdin carries the
   script. Base64 keeps them out of shell quoting.
+  A rule with a full model name is refused while the installed dispatcher is
+  older than version 2.
 - `rules-reset <expected-revision>`: write the defaults the same way.
+- `models`: ask each provider that has a key for its models, and answer
+  `{"ok": true, "providers": {"zhipu": {"models": ["glm-5.3", "..."]}, "qwen":
+  {"error": "HTTP 404"}}}`. Only this command contacts a provider, and only when
+  the rules of a device are on screen or the user refreshes: `watch` does not. The
+  key goes to the `https` host in that provider's env file and nowhere else, redirects
+  are not followed, and it is never reported. Claude isn't asked, as a subscription
+  has no key for this. The app offers a built-in list for it instead.
 
 Installing is not an agent command, because stdin is taken. The app sends the
 bundled file over ssh to a temp file in `~/.local/bin`, checks its byte count,

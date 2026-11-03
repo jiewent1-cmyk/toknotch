@@ -881,6 +881,27 @@ class KeyPrivacy(DispatcherBase):
         with open(self.rules_path) as handle:
             self.assertNotIn(FAKE_KEY, handle.read())
 
+    def test_rules_take_a_full_name_for_its_own_provider_only(self):
+        self.write_dispatcher(2)
+        rules = self.rules_with_model("MiniMax-M2.5")
+        self.assertIs(self.cli("rules-set", encode(rules), "0")[0]["ok"], True)
+        for bad in ("glm-5.1", "m3 ; rm -rf x", "MiniMax-" + "x" * 90):
+            answer = self.cli("rules-set", encode(self.rules_with_model(bad)), "1")[0]
+            self.assertIs(answer["ok"], False, bad)
+            self.assertIn("levels.simple.minimax", answer["error"])
+
+    def test_full_names_wait_for_a_dispatcher_that_takes_them(self):
+        # The old one would call the file invalid and go back to its defaults.
+        self.write_dispatcher(1)
+        answer = self.cli("rules-set", encode(self.rules_with_model("MiniMax-M2.5")), "0")[0]
+        self.assertIs(answer["ok"], False)
+        self.assertIn("too old", answer["error"])
+        self.assertFalse(os.path.exists(self.rules_path))
+        self.assertIs(self.cli("rules-set", encode(self.rules_with_model("m27")), "0")[0]["ok"], True)
+
+    def write_dispatcher(self, version):
+        self.put(".local/bin/mm-worker", "#!/usr/bin/env python3\nMM_WORKER_VERSION = %d\n" % version)
+
     def rules_with_model(self, model):
         rules = copy.deepcopy(self.agent.DEFAULT_RULES)
         rules["levels"]["simple"]["minimax"] = model

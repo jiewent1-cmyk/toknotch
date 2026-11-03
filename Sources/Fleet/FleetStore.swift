@@ -43,6 +43,10 @@ final class FleetStore: ObservableObject {
     @Published private(set) var rulesNotices: [String: FleetRulesNotice] = [:]
     /// Devices whose dispatcher is being replaced.
     @Published private(set) var installing: Set<String> = []
+    /// By device. Read when a device's rules are shown, not with every report.
+    @Published private(set) var modelListings: [String: FleetModelListing] = [:]
+    @Published private(set) var loadingModels: Set<String> = []
+    @Published private(set) var modelListFailed: Set<String> = []
     /// By provider, from `fleet.json`.
     @Published private(set) var accountLimits: [String: Int]
     /// The last limit could not be written.
@@ -323,6 +327,33 @@ final class FleetStore: ObservableObject {
             let failure = await FleetConnection.install(dispatcherFile, on: device, alias: alias)
             installing.remove(id)
             rulesNotices[id] = failure.map(FleetRulesNotice.installFailed) ?? .installed
+        }
+    }
+
+    // MARK: Model lists
+
+    /// Whether this machine's `mm-worker` takes full model names.
+    func acceptsFullModelNames(on state: FleetDeviceState) -> Bool {
+        (state.snapshot?.dispatcher?.version ?? 0) >= FleetRules.fullNamesDispatcherVersion
+    }
+
+    /// Asks the machine for its providers' models. Once a session unless `again`.
+    func loadModels(on state: FleetDeviceState, again: Bool = false) {
+        guard canEditRules(on: state), acceptsFullModelNames(on: state), let script,
+              case .live(let alias) = state.link, !loadingModels.contains(state.id),
+              again || modelListings[state.id] == nil
+        else { return }
+        let id = state.id, device = state.device
+        loadingModels.insert(id)
+        modelListFailed.remove(id)
+        Task {
+            let listing = await FleetConnection.listModels(on: device, alias: alias, script: script)
+            loadingModels.remove(id)
+            if let listing {
+                modelListings[id] = listing
+            } else {
+                modelListFailed.insert(id)
+            }
         }
     }
 

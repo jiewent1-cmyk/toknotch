@@ -29,6 +29,35 @@ final class FleetTests: XCTestCase {
         XCTAssertTrue(worker.isCancellableHere)
     }
 
+    /// A model goes by a short name or by its provider's full name, on that provider only.
+    func testFullModelNamesAreAcceptedForTheirOwnProvider() {
+        XCTAssertTrue(FleetRules.isAllowedModel("glm-5.1", provider: "zhipu"))
+        XCTAssertTrue(FleetRules.isAllowedModel("MiniMax-M2.5", provider: "minimax"))
+        XCTAssertTrue(FleetRules.isAllowedModel("claude-fable-5-1", provider: "claude"))
+        XCTAssertFalse(FleetRules.isAllowedModel("glm-5.1", provider: "minimax"))
+        XCTAssertFalse(FleetRules.isAllowedModel("sk-FAKE-KEY", provider: "zhipu"))
+        XCTAssertFalse(FleetRules.isAllowedModel("glm-5; rm -rf", provider: "zhipu"))
+    }
+
+    func testMenusListWhatTheProviderOffersOnceEach() {
+        let ids = { (listed: [String], current: String?, full: Bool) in
+            FleetRules.menuModels(provider: "zhipu", listed: listed, current: current, acceptsFullNames: full)
+                .map(\.id)
+        }
+        XCTAssertEqual(ids(["glm-5.3-flash", "glm-5.1", "other"], nil, true), ["flash", "glm-5.1"])
+        XCTAssertEqual(ids(["glm-5.1"], nil, false), ["flash"], "an older mm-worker can't take full names")
+        XCTAssertEqual(ids([], "glm-4.5", true), ["flash", "glm-4.5"], "the current choice stays on the menu")
+    }
+
+    func testModelListingKeepsListsAndErrorsApart() {
+        let output = "profile noise\n"
+            + #"{"ok":true,"providers":{"zhipu":{"models":["glm-5"]},"qwen":{"error":"HTTP 404"}}}"#
+        let listing = FleetModelListing(output: Data(output.utf8))
+        XCTAssertEqual(listing?.models, ["zhipu": ["glm-5"]])
+        XCTAssertEqual(listing?.errors, ["qwen": "HTTP 404"])
+        XCTAssertNil(FleetModelListing(output: Data("nothing useful".utf8)))
+    }
+
     /// ssh quits without reading when a host is unreachable, and the agent is larger
     /// than a pipe holds. Writing to it must fail, not end the app with a SIGPIPE.
     func testInputPipesReportAWriteErrorInsteadOfSIGPIPE() {

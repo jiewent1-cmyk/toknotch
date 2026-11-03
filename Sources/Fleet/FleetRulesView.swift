@@ -350,17 +350,57 @@ struct FleetRulesSection: View {
                     }
                 }
             }
+            modelListStatus(rules)
+        }
+        .task(id: "\(state.isLive)-\(store.acceptsFullModelNames(on: state))") {
+            store.loadModels(on: state)
         }
     }
 
+    /// Where the menus' models came from, and what went wrong getting them.
+    @ViewBuilder
+    private func modelListStatus(_ rules: FleetRules) -> some View {
+        if !store.acceptsFullModelNames(on: state) {
+            note(language.t("fleet.rules.models.needsUpdate"))
+        } else {
+            HStack(spacing: 8) {
+                note(language.t(store.modelListFailed.contains(state.id)
+                                ? "fleet.rules.models.failed" : "fleet.rules.models.source"))
+                Button(language.t("fleet.rules.models.refresh")) { store.loadModels(on: state, again: true) }
+                    .controlSize(.small)
+                    .disabled(!canEdit || store.loadingModels.contains(state.id))
+                if store.loadingModels.contains(state.id) {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            // A provider that is switched off has no need of a list.
+            ForEach(FleetRules.providerNames.filter {
+                rules.providers[$0]?.enabled == true && store.modelListings[state.id]?.errors[$0] != nil
+            }, id: \.self) { provider in
+                note(language.t("fleet.rules.models.providerFailed", FleetRulesText.provider(provider, language),
+                                store.modelListings[state.id]?.errors[provider] ?? ""))
+            }
+        }
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(verbatim: text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
     private func modelMenu(level: String, provider: String, rules: FleetRules) -> some View {
-        Picker(selection: Binding<String?>(
+        let models = FleetRules.menuModels(provider: provider,
+                                           listed: store.modelListings[state.id]?.models[provider] ?? [],
+                                           current: rules.model(level: level, provider: provider),
+                                           acceptsFullNames: store.acceptsFullModelNames(on: state))
+        return Picker(selection: Binding<String?>(
             get: { rules.model(level: level, provider: provider) },
             set: { value in store.editRules(on: state) { $0.setModel(value, level: level, provider: provider) } }
         )) {
             Text(language.t("fleet.rules.dontUse")).tag(String?.none)
             Divider()
-            ForEach(FleetRules.allowedModels[provider] ?? [], id: \.id) { model in
+            ForEach(models, id: \.id) { model in
                 Text(verbatim: model.displayName).tag(String?.some(model.id))
             }
         } label: { EmptyView() }
@@ -369,7 +409,7 @@ struct FleetRulesSection: View {
             .frame(maxWidth: .infinity)
             .disabled(!canEdit)
             // A narrow window cuts "MiniMax-M2.7" and "MiniMax-M2.7-highspeed" alike.
-            .help((FleetRules.allowedModels[provider] ?? [])
+            .help(models
                 .first { $0.id == rules.model(level: level, provider: provider) }?.displayName ?? "")
     }
 

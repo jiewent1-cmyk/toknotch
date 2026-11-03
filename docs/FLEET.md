@@ -250,7 +250,10 @@ refuses to save anything the machine would reject.
   of slots in use, whether a key is configured on that machine, and a
   cooling-down notice with its reason.
 - **Model for each level** — a menu per level and provider; *Don't use*
-  leaves a provider out of that level. A level left with no enabled provider
+  leaves a provider out of that level. The menus list every model the provider's
+  API reports, read once when the rules are shown and on demand. Claude's is a
+  built-in list, as a subscription has no key to ask with. This needs that machine's
+  `mm-worker` at version 2 or later. A level left with no enabled provider
   is called out, since only a task sent straight to a provider would run.
 - **Balance** — *Proportional* (the provider using the smallest share of its
   slots; ties follow the order) or *Priority* (the first provider in the
@@ -328,8 +331,8 @@ is passed to Claude Code.
 |---|---|
 | `-l, --level simple\|normal\|hard` | Task level (default `normal`, or `simple` with `-m fast`) |
 | `-b, -P, --backend auto\|minimax\|zhipu\|claude\|qwen` | Force a provider, even a disabled one (default `auto`) |
-| `-m, --mm-model m3\|m27\|fast` | MiniMax model |
-| `-z, --zp-model flash` | Zhipu model |
+| `-m, --mm-model m3\|m27\|fast\|full name` | MiniMax model |
+| `-z, --zp-model flash\|full name` | Zhipu model |
 | `-q, --qw-model glm\|max\|flash\|lite\|ds` | Qwen endpoint model |
 | `-c, --claude-model MODEL` | Claude model (opus only for hard) |
 | `-t, --timeout SEC` | Timeout for one run (default from the rules) |

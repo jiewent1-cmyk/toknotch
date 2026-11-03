@@ -290,6 +290,11 @@
 "fleet.rules.issue.emptyLevel" = "「%@」級別至少需要一個供應商。";
 "fleet.rules.issue.levelProvider" = "「%1$@」級別使用了未列出的供應商：%2$@。";
 "fleet.rules.issue.model" = "「%1$@」級別使用了 %2$@ 不提供的模型。";
+"fleet.rules.models.source" = "除簡稱外的模型來自各供應商的 API；Claude 的是內建清單。";
+"fleet.rules.models.failed" = "無法從這台機器讀取供應商的模型清單，選單只顯示內建模型。";
+"fleet.rules.models.providerFailed" = "無法讀取 %1$@ 的模型清單（%2$@），它的選單只顯示內建模型。";
+"fleet.rules.models.refresh" = "重新整理模型";
+"fleet.rules.models.needsUpdate" = "更新這台機器的 mm-worker 後，才能從供應商的全部模型中選擇。";
 "fleet.rules.issue.timeout" = "預設逾時必須在 %1$d 到 %2$d 秒之間。";
 "fleet.rules.issue.cooldown" = "冷卻時間必須在 %1$d 到 %2$d 秒之間。";
 "fleet.rules.failure.timedOut" = "機器未在時限內完成，結果未知。請先查看這裡的狀態再重試。";
