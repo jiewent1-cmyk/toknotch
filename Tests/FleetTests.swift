@@ -49,6 +49,21 @@ final class FleetTests: XCTestCase {
         XCTAssertEqual(ids([], "glm-4.5", true), ["flash", "glm-4.5"], "the current choice stays on the menu")
     }
 
+    func testHiddenModelsStayOffTheMenuUnlessAlreadyChosen() {
+        let ids = { (current: String?) in
+            FleetRules.menuModels(provider: "zhipu", listed: ["glm-5.3-flashx", "glm-5.1"], current: current,
+                                  acceptsFullNames: true).map(\.id)
+        }
+        XCTAssertEqual(ids(nil), ["flash", "glm-5.1"])
+        XCTAssertEqual(ids("glm-5.3-flashx"), ["flash", "glm-5.1", "glm-5.3-flashx"])
+    }
+
+    func testAnUnknownCLIIsAnIssueAndAbsentMeansClaude() throws {
+        XCTAssertEqual(issues { $0.cli = nil }, [])
+        XCTAssertEqual(issues { $0.cli = "opencode" }, [])
+        XCTAssertEqual(issues { $0.cli = "nope" }, [.cli])
+    }
+
     func testModelListingKeepsListsAndErrorsApart() {
         let output = "profile noise\n"
             + #"{"ok":true,"providers":{"zhipu":{"models":["glm-5"]},"qwen":{"error":"HTTP 404"}}}"#

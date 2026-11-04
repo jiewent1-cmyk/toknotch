@@ -290,6 +290,9 @@
 "fleet.rules.issue.emptyLevel" = "%@ needs at least one provider.";
 "fleet.rules.issue.levelProvider" = "%1$@ names a provider that isn’t listed: %2$@.";
 "fleet.rules.issue.model" = "%1$@ uses a model %2$@ doesn’t offer.";
+"fleet.rules.issue.cli" = "This machine’s rules name a CLI this app doesn’t know.";
+"fleet.rules.cli" = "Agent CLI";
+"fleet.rules.cli.help" = "opencode runs MiniMax, Zhipu and Qwen on this machine, not Claude.";
 "fleet.rules.models.source" = "Models beyond the short names come from each provider’s API. Claude’s are a built-in list.";
 "fleet.rules.models.failed" = "Couldn’t read the provider lists from this machine, so the menus show the built-in models.";
 "fleet.rules.models.providerFailed" = "%1$@’s list couldn’t be read (%2$@), so its menu shows the built-in models.";

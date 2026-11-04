@@ -17,6 +17,12 @@ What's New sheet after an update.
   built-in list, as a subscription has no key to ask with. This needs `mm-worker`
   version 2 on that machine, and the app offers the update.
 
+- **`mm-worker` can run workers through opencode.** Choose it with `--cli opencode`
+  or the rule `cli`, also in the Fleet window, on a machine that uses MiniMax, Zhipu
+  or Qwen without Claude. `--allowedTools` becomes opencode permissions, with reads
+  open and everything else denied unless named. This is `mm-worker` version 3.
+- **`glm-5.3-flashx` stays off the model menu**, as the GLM Coding Plan refuses it.
+
 ### Fixed
 
 - **Fleet quit the whole app when a machine was unreachable.** Away from home,

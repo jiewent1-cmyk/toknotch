@@ -26,9 +26,15 @@ struct FleetRules: Codable, Equatable {
     /// Level, then provider, then that provider's model at this level.
     var levels: [String: [String: String]]
     var defaults: Defaults
+    /// The command-line agent that runs workers. Nil means claude.
+    var cli: String?
+
+    static let clis = ["claude", "opencode"]
+    /// The first `mm-worker` that reads `cli`.
+    static let cliDispatcherVersion = 3
 
     /// The `MM_WORKER_VERSION` of the `mm-worker.py` in this app's bundle.
-    static let bundledDispatcherVersion = 2
+    static let bundledDispatcherVersion = 3
     /// The first `mm-worker` that accepts full model names. An older one would
     /// call such rules invalid and silently go back to its defaults.
     static let fullNamesDispatcherVersion = 2
@@ -108,6 +114,7 @@ extension FleetRules {
         case revision
         case balance
         case order
+        case cli
         case unknownProvider(String)
         case slots(provider: String)
         case missingLevel(String)
@@ -125,6 +132,7 @@ extension FleetRules {
             case .revision: return "revision"
             case .balance: return "balance"
             case .order: return "order"
+            case .cli: return "cli"
             case .unknownProvider(let provider): return "providers.\(provider)"
             case .slots(let provider): return "providers.\(provider).slots"
             case .missingLevel(let level), .unknownLevel(let level), .emptyLevel(let level):
@@ -144,6 +152,7 @@ extension FleetRules {
         if revision < 0 { issues.append(.revision) }
         if !Self.balances.contains(balance) { issues.append(.balance) }
         if !isOrderValid { issues.append(.order) }
+        if let cli, !Self.clis.contains(cli) { issues.append(.cli) }
         for provider in providers.keys.sorted() {
             if !Self.providerNames.contains(provider) { issues.append(.unknownProvider(provider)) }
             if let slots = providers[provider]?.slots, !Self.slotRange.contains(slots) {
@@ -236,6 +245,12 @@ extension FleetRules {
         "qwen": ["qwen", "glm-", "deepseek-"],
     ]
 
+    /// What a provider lists but this account can't use: the GLM Coding Plan
+    /// answers `glm-5.3-flashx` with error 1311. Compared without regard to case.
+    static let hiddenModels: [String: Set<String>] = [
+        "zhipu": ["glm-5.3-flashx"],
+    ]
+
     /// A subscription has no key to ask with, so Claude's list can't come from
     /// its API like the others.
     static let knownFullModels: [String: [Model]] = [
@@ -272,7 +287,8 @@ extension FleetRules {
         }
         if acceptsFullNames {
             (knownFullModels[provider] ?? []).forEach(add)
-            listed.filter { isFullModelName($0, provider: provider) }
+            let hidden = hiddenModels[provider] ?? []
+            listed.filter { isFullModelName($0, provider: provider) && !hidden.contains($0.lowercased()) }
                 .forEach { add(Model(id: $0, displayName: $0)) }
         }
         if let current, !menu.contains(where: { $0.id == current }) {

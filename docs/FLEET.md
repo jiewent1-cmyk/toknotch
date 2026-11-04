@@ -252,9 +252,12 @@ refuses to save anything the machine would reject.
 - **Model for each level** — a menu per level and provider; *Don't use*
   leaves a provider out of that level. The menus list every model the provider's
   API reports, read once when the rules are shown and on demand. Claude's is a
-  built-in list, as a subscription has no key to ask with. This needs that machine's
+  built-in list, as a subscription has no key to ask with. Models an account can't
+  use, like `glm-5.3-flashx` on the GLM Coding Plan, are left out. This needs that machine's
   `mm-worker` at version 2 or later. A level left with no enabled provider
   is called out, since only a task sent straight to a provider would run.
+- **Agent CLI** — `claude` or `opencode`, for machines that run workers through
+  opencode with MiniMax, Zhipu or Qwen and no Claude. See `docs/FLEET-RULES.md`.
 - **Balance** — *Proportional* (the provider using the smallest share of its
   slots; ties follow the order) or *Priority* (the first provider in the
   order with a free slot).
@@ -333,6 +336,7 @@ is passed to Claude Code.
 | `-b, -P, --backend auto\|minimax\|zhipu\|claude\|qwen` | Force a provider, even a disabled one (default `auto`) |
 | `-m, --mm-model m3\|m27\|fast\|full name` | MiniMax model |
 | `-z, --zp-model flash\|full name` | Zhipu model |
+| `--cli claude\|opencode` | Agent that runs the worker, on this machine |
 | `-q, --qw-model glm\|max\|flash\|lite\|ds` | Qwen endpoint model |
 | `-c, --claude-model MODEL` | Claude model (opus only for hard) |
 | `-t, --timeout SEC` | Timeout for one run (default from the rules) |

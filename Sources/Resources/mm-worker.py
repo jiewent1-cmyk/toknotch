@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-MM_WORKER_VERSION = 2
+MM_WORKER_VERSION = 3
 
 # mm-worker: runs one non-interactive Claude Code task on one of several
 # providers, chosen by task level and load, and moves to the next provider when
@@ -39,6 +39,9 @@ usage: mm-worker [options] "prompt"
   -q, --qw-model glm|max|flash|lite|ds
                                    Qwen endpoint model
   -c, --claude-model MODEL         Claude model (opus only for hard)
+      --cli claude|opencode        Agent to run the worker with (or MM_WORKER_CLI, or the
+                                   rule "cli"; default claude). opencode: minimax, zhipu,
+                                   qwen on this machine; after --, only --allowedTools
   -t, --timeout SEC                timeout for one run (default from rules)
   -n, --name NAME                  task name shown in Fleet
   -H, --host HOST                  run the worker on another machine over ssh
@@ -60,6 +63,9 @@ MODELS = {
     "claude": ("sonnet", "haiku", "claude-opus-5-5"),
     "qwen": ("glm", "max", "flash", "lite", "ds"),
 }
+
+# The command-line agents that can run a worker.
+CLIS = ("claude", "opencode")
 
 # Besides the short names above, a rule may name a model as the provider's own
 # API does. The prefix keeps one provider's model off another, and keeps a key
@@ -130,6 +136,8 @@ PROBES = {
 SCRUBBED = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
             "API_TIMEOUT_MS", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_QWEN_SESSION")
 CLAUDE_FALLBACKS = ("~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
+OPENCODE_FALLBACKS = ("~/.local/bin/opencode", "~/.opencode/bin/opencode", "/opt/homebrew/bin/opencode",
+                      "/usr/local/bin/opencode")
 
 # Quota errors as the providers word them, including their Chinese texts for
 # balance, quota, limit and expiry, and their numeric quota codes.
@@ -200,10 +208,14 @@ def _exact_keys(obj, keys, where):
 
 def validate_rules(rules):
     """None if the rules are valid, otherwise what is wrong with them."""
-    error = _exact_keys(rules, ("version", "revision", "balance", "order", "providers", "levels",
-                                "defaults"), "rules")
+    # cli is optional, and absent means claude, so the defaults stay as they were.
+    required = {key: value for key, value in rules.items() if key != "cli"} if isinstance(rules, dict) else rules
+    error = _exact_keys(required, ("version", "revision", "balance", "order", "providers", "levels",
+                                   "defaults"), "rules")
     if error:
         return error
+    if rules.get("cli", "claude") not in CLIS:
+        return "cli must be one of %s" % ", ".join(CLIS)
     if not _is_int(rules["version"]) or rules["version"] != 1:
         return "version must be 1"
     if not _is_int(rules["revision"]) or rules["revision"] < 0:
@@ -395,6 +407,179 @@ def find_claude():
     return None
 
 
+def find_opencode():
+    found = shutil.which("opencode")
+    if found:
+        return found
+    for path in OPENCODE_FALLBACKS:
+        path = os.path.expanduser(path)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+# ---------- opencode ----------
+
+# opencode's own id for a provider must not be "minimax": its built-in entry of
+# that name hides or breaks models. Host variable, path below it, key variable.
+OPENCODE_BACKENDS = {
+    "minimax": ("mm", "MINIMAX_API_HOST", "/anthropic/v1", "MINIMAX_API_KEY"),
+    "zhipu": ("zp", "ZHIPU_API_HOST", "/v1", "ZHIPU_API_KEY"),
+    "qwen": ("qw", "QWEN_API_HOST", "/v1", "QWEN_API_KEY"),
+}
+# What the short names mean, as ALIASES does for claude through provider_env.
+MODEL_NAMES = {
+    "minimax": {"m3": "MiniMax-M3", "m27": "MiniMax-M2.7", "fast": "MiniMax-M2.7-highspeed"},
+    "zhipu": {"flash": "glm-5.3-flash"},
+    "qwen": {"glm": "glm-5.3", "max": "qwen3.8-max", "flash": "qwen3.8-flash",
+             "lite": "qwen3.6-flash", "ds": "deepseek-v4-pro-0813"},
+}
+# claude's tool names, and the opencode permission each one opens.
+OPENCODE_TOOLS = {
+    "Read": "read", "Glob": "glob", "Grep": "grep", "LS": "list", "Edit": "edit", "Write": "edit",
+    "MultiEdit": "edit", "NotebookEdit": "edit", "WebFetch": "webfetch", "WebSearch": "websearch",
+    "Task": "task", "TodoWrite": "todowrite",
+}
+# opencode matches a command's text by prefix, so `echo *` also lets through
+# `echo x > file` and `echo $(touch file)`, and a worker told no will try exactly
+# that. The last matching rule wins, so these go after the allowed commands.
+BASH_ESCAPES = ("*>*", "*<*", "*$(*", "*`*", "*;*", "*&*", "*|*", "*\n*")
+TOOL_SPEC = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\([^)]*\))?")
+
+
+def opencode_permission(extra):
+    """The permissions for claude-style arguments after `--`, as tight as claude -p:
+    reading is open, and everything else is denied unless --allowedTools names it.
+    With no permissions at all, opencode would let a worker write anything, so every
+    run sets them, each by name so that no opencode.json can open one up. An argument
+    with no equivalent is an error, as dropping it could widen what the worker may do."""
+    specs, i = [], 0
+    while i < len(extra):
+        arg = extra[i]
+        i += 1
+        if arg.startswith(("--allowedTools=", "--allowed-tools=")):
+            specs.append(arg.split("=", 1)[1])
+        elif arg in ("--allowedTools", "--allowed-tools"):
+            while i < len(extra) and not extra[i].startswith("-"):
+                specs.append(extra[i])
+                i += 1
+        else:
+            raise UsageError("opencode has no equivalent of %s" % arg)
+    permission = {"*": "deny", "edit": "deny", "bash": "deny", "task": "deny", "webfetch": "deny",
+                  "websearch": "deny", "todowrite": "deny", "skill": "deny", "lsp": "deny",
+                  "question": "deny", "doom_loop": "deny",
+                  "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+                  "glob": "allow", "grep": "allow", "list": "allow",
+                  # Each tool's own permission still decides; prompts use absolute paths.
+                  "external_directory": "allow"}
+    commands = None
+    for spec in specs:
+        for tool in TOOL_SPEC.findall(spec):
+            if tool == "Bash":
+                commands = "all"
+            elif tool.startswith("Bash("):
+                if commands != "all":
+                    commands = commands or {"*": "deny"}
+                    inner = tool[5:-1].strip()
+                    if inner.endswith(":*"):
+                        commands[inner[:-2]] = "allow"
+                        commands[inner[:-2] + " *"] = "allow"
+                    else:
+                        commands[inner] = "allow"
+            elif tool in OPENCODE_TOOLS:
+                if OPENCODE_TOOLS[tool] != "read":
+                    permission[OPENCODE_TOOLS[tool]] = "allow"
+            else:
+                log("opencode worker: %s has no equivalent and stays denied" % tool)
+    if commands == "all":
+        permission["bash"] = "allow"
+    elif commands:
+        permission["bash"] = dict(commands, **{escape: "deny" for escape in BASH_ESCAPES})
+    return permission
+
+
+def opencode_config(provider, model, permission, values):
+    """The whole configuration of one run, so a machine needs no opencode.json."""
+    pid, host_var, path, key_var = OPENCODE_BACKENDS[provider]
+    name = MODEL_NAMES[provider].get(model, model)
+    context = 1000000 if name.startswith("MiniMax-M3") else 200000
+    return {
+        "enabled_providers": [pid],
+        "model": "%s/%s" % (pid, name),
+        "small_model": "%s/%s" % (pid, name),
+        "autoupdate": False,
+        "share": "disabled",
+        "snapshot": False,
+        "permission": permission,
+        "provider": {pid: {
+            "name": provider,
+            "npm": "@ai-sdk/anthropic",
+            "options": {"baseURL": values.get(host_var, "") + path, "apiKey": "{env:%s}" % key_var},
+            "models": {name: {"name": name, "limit": {"context": context, "output": 32000}}},
+        }},
+    }
+
+
+def opencode_args(executable, provider, model):
+    name = MODEL_NAMES[provider].get(model, model)
+    return [executable, "run", "--format", "json", "-m", "%s/%s" % (OPENCODE_BACKENDS[provider][0], name)]
+
+
+def opencode_env(provider, model, permission, base):
+    env = dict(base)
+    env.update(read_env_file(env_file(provider)))
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_config(provider, model, permission, env))
+    return env
+
+
+def finish_opencode_stream(path):
+    """Add the result line claude ends its stream with, so everything after this
+    treats both alike. A stream that just stops gets none, which reads as a failure."""
+    text, tokens_in, tokens_out, reason, error = [], 0, 0, None, None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                part = event.get("part") if isinstance(event.get("part"), dict) else {}
+                kind = event.get("type")
+                if kind == "step_start":
+                    text = []  # the answer is what the last step said
+                elif kind == "text" and isinstance(part.get("text"), str):
+                    text.append(part["text"])
+                elif kind == "step_finish":
+                    reason = part.get("reason")
+                    tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+                    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+                    for field, source in (("input", tokens), ("read", cache), ("write", cache)):
+                        if isinstance(source.get(field), int):
+                            tokens_in += source[field]
+                    if isinstance(tokens.get("output"), int):
+                        tokens_out += tokens["output"]
+                elif kind == "error":
+                    error = event.get("error") if isinstance(event.get("error"), dict) else {}
+    except OSError:
+        return
+    usage = {"input_tokens": tokens_in, "output_tokens": tokens_out}
+    if error is not None:
+        data = error.get("data") if isinstance(error.get("data"), dict) else {}
+        status = data.get("statusCode")
+        message = str(data.get("message") or error.get("name") or "unknown error")[:500]
+        result = {"type": "result", "is_error": True, "result": message, "usage": usage,
+                  # Any status: an opencode error means the task didn't run, so another provider may.
+                  "api_error_status": status if isinstance(status, int) else "opencode"}
+    elif reason in ("stop", "end_turn", "length") and text:
+        result = {"type": "result", "is_error": False, "result": "".join(text), "usage": usage}
+    else:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+
 def http_probe(url, key, model, timeout):
     """(status or None, body text) of a one-token request."""
     data = json.dumps({"model": model, "max_tokens": 1,
@@ -563,6 +748,7 @@ VALUE_FLAGS = {
     "-q": "qw_model", "--qw-model": "qw_model",
     "-z": "zp_model", "--zp-model": "zp_model",
     "-c": "claude_model", "--claude-model": "claude_model",
+    "--cli": "cli",
     "-b": "backend", "-P": "backend", "--backend": "backend",
     "-t": "timeout", "--timeout": "timeout",
     "-n": "name", "--name": "name",
@@ -581,6 +767,7 @@ class Options(object):
         self.qw_model = None
         self.zp_model = None
         self.claude_model = os.environ.get("MM_WORKER_CLAUDE_MODEL") or None
+        self.cli = os.environ.get("MM_WORKER_CLI") or None
         self.backend = "auto"
         self.timeout = None
         self.name = None
@@ -628,6 +815,10 @@ def parse_args(argv):
             i += 1
     if options.backend != "auto" and options.backend not in PROVIDERS:
         raise UsageError("unknown backend: %s" % options.backend)
+    if options.cli and options.cli not in CLIS:
+        raise UsageError("unknown cli: %s" % options.cli)
+    if options.cli == "opencode" and options.host:
+        raise UsageError("--cli opencode runs on this machine only, not with -H")
     if options.timeout is not None:
         options.timeout = _positive(options.timeout, "timeout")
     if options.host and options.host.startswith("-"):
@@ -653,6 +844,9 @@ class Dispatcher(object):
         self.poll = self._env_float("MM_WORKER_POLL", POLL_DEFAULT)
         self.offline_wait = self._env_float("MM_WORKER_OFFLINE_WAIT", OFFLINE_WAIT_DEFAULT)
         self.claude = None
+        self.opencode = None
+        self.cli = "claude"
+        self.permission = None
         self.slot = None
         self.lock_held = False
         self.child = None
@@ -958,10 +1152,19 @@ class Dispatcher(object):
     # --- running locally
 
     def run_local(self, provider, alias, out):
-        args = [self.claude, "--model", alias, "-p", "--output-format", "stream-json",
-                "--verbose"] + self.o.extra
-        env = provider_env(provider, self.base_env)
-        with open(self.prompt_path, "rb") as stdin, open(out, "wb") as stdout, \
+        if self.cli == "opencode":
+            model = self.model_for(provider)
+            args = opencode_args(self.opencode, provider, model)
+            env = opencode_env(provider, model, self.permission, self.base_env)
+            # Fleet reads the model from this line: opencode's events don't carry one.
+            with open(out, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "system", "subtype": "init",
+                                         "model": MODEL_NAMES[provider].get(model, model)}) + "\n")
+        else:
+            args = [self.claude, "--model", alias, "-p", "--output-format", "stream-json",
+                    "--verbose"] + self.o.extra
+            env = provider_env(provider, self.base_env)
+        with open(self.prompt_path, "rb") as stdin, open(out, "ab" if self.cli == "opencode" else "wb") as stdout, \
                 open(self.stderr_path, "ab") as stderr:
             self.critical(True)
             try:
@@ -985,6 +1188,8 @@ class Dispatcher(object):
         # Whatever the worker left running in its group goes with it.
         end_group(proc, STRAGGLER_GRACE)
         self.child = None
+        if self.cli == "opencode":
+            finish_opencode_stream(out)
         compact(out)
         if self.cancelled():
             return CANCELLED
@@ -1190,7 +1395,22 @@ class Dispatcher(object):
         if self.level != "hard" and o.claude_model and "opus" in o.claude_model:
             log("opus is only for hard tasks, using sonnet")
             o.claude_model = "sonnet"
-        if not o.host:
+        # A task sent to another machine runs there with mm-remote-run, under claude.
+        self.cli = "claude" if o.host else (o.cli or self.rules.get("cli", "claude"))
+        if self.cli == "opencode":
+            if o.backend == "claude":
+                log("opencode runs minimax, zhipu or qwen; claude needs --cli claude")
+                raise Exit(2)
+            try:
+                self.permission = opencode_permission(o.extra)
+            except UsageError as error:
+                log(str(error))
+                raise Exit(2)
+            self.opencode = find_opencode()
+            if not self.opencode:
+                log("opencode not found on PATH or in %s" % ", ".join(OPENCODE_FALLBACKS))
+                raise Exit(127)
+        elif not o.host:
             self.claude = find_claude()
             if not self.claude:
                 log("claude not found on PATH or in %s" % ", ".join(CLAUDE_FALLBACKS))
@@ -1228,7 +1448,8 @@ class Dispatcher(object):
             # together sees the same counts and piles onto one provider.
             self.take_lock()
             try:
-                candidates = self.candidates()
+                candidates = [name for name in self.candidates()
+                              if self.cli != "opencode" or name in OPENCODE_BACKENDS]
                 for provider in candidates:
                     if provider in tried:
                         continue

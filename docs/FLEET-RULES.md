@@ -69,6 +69,27 @@ Allowed models, by provider:
 | `claude` | `sonnet`, `haiku`, `claude-opus-5-5` | |
 | `qwen` | `glm`, `max`, `flash`, `lite`, `ds` | GLM-5.3, qwen3.8-max, qwen3.8-flash, qwen3.6-flash, DeepSeek-V4-Pro-0813 |
 
+The optional top-level `cli` chooses the agent that runs workers: `claude` (what
+leaving it out means) or `opencode`. It needs `MM_WORKER_VERSION` 3, and `rules-set`
+refuses it on an older dispatcher or, for `opencode`, on a machine without the
+command. `--cli` and `MM_WORKER_CLI` override it for one task.
+
+With `opencode`:
+
+- Each run carries its whole configuration in `OPENCODE_CONFIG_CONTENT`, so a machine
+  needs only the command and the provider's env file. Keys stay in the environment.
+- `claude` is never a candidate, as there is nothing to log in with, and `-b claude`
+  is an error. Levels that name only `claude` have no provider.
+- After `--`, only `--allowedTools` is accepted, and it is translated to permissions.
+  Anything else stops the task, as dropping a flag could widen what a worker may do.
+- Reading is open, except `.env` files. Everything else is denied unless named.
+  `Bash(cmd:*)` also refuses redirection, command substitution, chaining and pipes,
+  since opencode matches by prefix. It still can't limit what `cmd` itself does, so
+  `Bash(python3:*)` is as open as running any program.
+- Only on this machine: a task with `-H` runs there under `claude`.
+- Tokens reach the ledger, but Fleet's token counts read Claude Code's logs, so these
+  workers aren't in them.
+
 A rule may also name any model by its full name, as the provider's API lists it:
 up to 80 letters, digits, `.`, `_`, `:` or `-`, starting with `MiniMax-`
 (`minimax`), `glm-` (`zhipu`), `claude-` (`claude`), or `qwen`, `glm-` or

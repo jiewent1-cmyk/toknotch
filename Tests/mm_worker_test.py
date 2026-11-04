@@ -814,6 +814,125 @@ class RulesValidation(unittest.TestCase):
         self.assertEqual(agent.DEFAULT_RULES, MW.DEFAULT_RULES)
 
 
+FAKE_OPENCODE = r'''#!@PYTHON@
+import json, os, sys
+env = os.environ
+config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+provider = next(iter(config["provider"]))
+prompt = sys.stdin.read()
+log = env.get("FAKE_LOG")
+if log:
+    with open(os.path.join(log, "opencode-%d.json" % os.getpid()), "w") as f:
+        json.dump({"argv": sys.argv[1:], "config": config, "prompt": prompt,
+                   "keys": {k: v for k, v in env.items() if k.endswith("_API_KEY")}}, f)
+mode = env.get("MODE_OC_" + provider, "ok")
+def ev(o):
+    print(json.dumps(o), flush=True)
+ev({"type": "step_start", "sessionID": "s", "part": {}})
+ev({"type": "text", "part": {"text": "thinking about usage limit exceeded"}})
+if mode == "cut":
+    ev({"type": "step_finish", "part": {"reason": "tool-calls", "tokens": {"input": 1, "output": 1}}})
+    sys.exit(0)
+if mode == "error":
+    ev({"type": "error", "error": {"name": "APIError", "data": {"message": "login fail", "statusCode": 401}}})
+    sys.exit(1)
+ev({"type": "step_finish", "part": {"reason": "tool-calls", "tokens": {"input": 10, "output": 2, "cache": {"read": 5, "write": 1}}}})
+ev({"type": "step_start", "part": {}})
+ev({"type": "text", "part": {"text": "RESULT-from-" + provider}})
+ev({"type": "step_finish", "part": {"reason": "stop", "tokens": {"input": 3, "output": 4, "cache": {"read": 0, "write": 0}}}})
+'''
+
+
+class Opencode(Base):
+    def provider_of(self, done):
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        return done.stdout.decode().strip().replace("RESULT-from-", "")
+
+    def install(self):
+        write(os.path.join(self.bin, "opencode"), FAKE_OPENCODE.replace("@PYTHON@", PY), 0o755)
+
+    def runs(self):
+        found = []
+        for name in sorted(os.listdir(self.log)):
+            if name.startswith("opencode-"):
+                with open(os.path.join(self.log, name)) as handle:
+                    found.append(json.load(handle))
+        return found
+
+    def test_the_answer_comes_from_the_last_step_and_is_counted(self):
+        self.install()
+        done = self.mw("--cli", "opencode", "-l", "simple", "x")
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertEqual(done.stdout.decode().strip(), "RESULT-from-mm")
+        run = self.runs()[-1]
+        self.assertEqual(run["argv"][:5], ["run", "--format", "json", "-m", "mm/MiniMax-M2.7-highspeed"])
+        self.assertEqual(run["prompt"].strip(), "x")
+        self.assertEqual(run["keys"], {"MINIMAX_API_KEY": "key-minimax"})
+        self.assertIn("MINIMAX_API_KEY", run["config"]["provider"]["mm"]["options"]["apiKey"])
+        self.assertNotIn("key-minimax", json.dumps(run["config"]))
+
+    def test_with_no_tools_named_a_worker_can_only_read(self):
+        self.install()
+        self.mw("--cli", "opencode", "x")
+        permission = self.runs()[-1]["config"]["permission"]
+        self.assertEqual(permission["*"], "deny")
+        for name in ("edit", "bash", "webfetch", "websearch", "task"):
+            self.assertEqual(permission[name], "deny", name)
+        self.assertEqual(permission["read"]["*"], "allow")
+        self.assertEqual(permission["read"]["*.env"], "deny")
+
+    def test_allowed_tools_open_exactly_what_they_name(self):
+        permission = MW.opencode_permission(["--allowedTools", "Read,Edit,Bash(python3:*),Bash(git status),mcp__x__y"])
+        self.assertEqual(permission["edit"], "allow")
+        rules = list(permission["bash"].items())
+        self.assertEqual(rules[:4], [("*", "deny"), ("python3", "allow"), ("python3 *", "allow"), ("git status", "allow")])
+        # The last match wins, so a redirect after an allowed command is still refused.
+        self.assertEqual([name for name, value in rules[4:] if value != "deny"], [])
+        for escape in ("*>*", "*$(*", "*;*", "*&*", "*|*"):
+            self.assertIn(escape, permission["bash"])
+        self.assertEqual(permission["webfetch"], "deny")
+        self.assertEqual(MW.opencode_permission(["--allowedTools=Bash"])["bash"], "allow")
+
+    def test_a_flag_with_no_equivalent_stops_the_task(self):
+        self.install()
+        done = self.mw("--cli", "opencode", "x", "--", "--dangerously-skip-permissions")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("no equivalent", done.stderr.decode())
+        self.assertEqual(self.runs(), [])
+
+    def test_an_error_moves_to_the_next_provider(self):
+        self.install()
+        done = self.mw("--cli", "opencode", "x", env={"MODE_OC_mm": "error"})
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertEqual(done.stdout.decode().strip(), "RESULT-from-zp")
+
+    def test_a_stream_that_just_stops_is_a_failure(self):
+        self.install()
+        done = self.mw("--cli", "opencode", "x", env={"MODE_OC_mm": "cut"})
+        self.assertEqual(done.stdout.decode().strip(), "RESULT-from-zp")
+        self.assertNotIn("usage limit", done.stderr.decode())
+
+    def test_claude_is_never_a_candidate(self):
+        self.install()
+        done = self.mw("--cli", "opencode", "-b", "claude", "x")
+        self.assertEqual(done.returncode, 2)
+        done = self.mw("--cli", "opencode", "-l", "hard", "x")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no enabled provider", done.stderr.decode())
+
+    def test_the_rule_chooses_the_cli_and_the_flag_overrides_it(self):
+        self.install()
+        self.rules(lambda r: r.update(cli="opencode"))
+        self.assertEqual(self.mw("x").stdout.decode().strip(), "RESULT-from-mm")
+        self.assertEqual(self.provider_of(self.mw("--cli", "claude", "x")), "minimax")
+
+    def test_a_task_for_another_machine_stays_with_claude(self):
+        self.install()
+        done = self.mw("--cli", "opencode", "-H", "somewhere", "x")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("this machine only", done.stderr.decode())
+
+
 class Rules(Base):
     def provider_of(self, done):
         self.assertEqual(done.returncode, 0, done.stderr.decode())
@@ -1310,7 +1429,7 @@ class Source(unittest.TestCase):
     def test_header(self):
         lines = self.text.splitlines()
         self.assertEqual(lines[0], "#!/usr/bin/env python3")
-        self.assertEqual(lines[1], "MM_WORKER_VERSION = 2")
+        self.assertEqual(lines[1], "MM_WORKER_VERSION = 3")
 
     def test_python_3_9_grammar(self):
         ast.parse(self.text, feature_version=(3, 9))

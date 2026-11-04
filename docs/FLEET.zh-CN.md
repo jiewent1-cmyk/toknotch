@@ -220,9 +220,12 @@ Fleet 从不读取、复制或显示这些值——见[安全与隐私](#安全�
   那台机器上是否配置了密钥，以及冷却中的原因。
 - **各级别使用的模型** —— 每个级别 × 每个提供商一个菜单；选「不使用」就把该
   提供商排除在这个级别之外。菜单列出提供商 API 返回的全部模型，打开规则时读取一次，
-  也可以手动刷新；Claude 订阅没有可用来查询的密钥，所以用内置列表。需要那台机器的
+  也可以手动刷新；Claude 订阅没有可用来查询的密钥，所以用内置列表。账户用不了的模型不显示，比如 GLM
+  Coding Plan 的 `glm-5.3-flashx`。需要那台机器的
   `mm-worker` 是第 2 版或更新。某个级别下面没有任何启用的提供商时会明确指出，
   因为这时只有直接指定提供商的任务才能跑。
+- **Agent CLI** —— `claude` 或 `opencode`，后者用于通过 opencode 运行 MiniMax、智谱
+  或千问、不用 Claude 的机器。详见 `docs/FLEET-RULES.md`。
 - **均衡方式** —— 「按比例」（选占用槽位比例最小的提供商，相同时按顺序）或
   「按优先级」（按顺序选第一个有空闲槽位的提供商）。
 - **提供商顺序** —— 上移、下移。
@@ -294,6 +297,7 @@ mm-worker --kill 20260612-101502-4311
 | `-b, -P, --backend auto\|minimax\|zhipu\|claude\|qwen` | 强制某个提供商，已停用的也可以（默认 `auto`） |
 | `-m, --mm-model m3\|m27\|fast\|完整模型名` | MiniMax 模型 |
 | `-z, --zp-model flash\|完整模型名` | 智谱模型 |
+| `--cli claude\|opencode` | 运行 worker 的 agent，仅限本机 |
 | `-q, --qw-model glm\|max\|flash\|lite\|ds` | 千问端点模型 |
 | `-c, --claude-model MODEL` | Claude 模型（opus 只用于 hard） |
 | `-t, --timeout SEC` | 单次运行超时（默认取自规则） |

@@ -113,6 +113,11 @@ def is_full_model_name(provider, model):
 # The first mm-worker that accepts full model names in its rules. An older one
 # would call the file invalid and silently go back to its defaults.
 FULL_NAMES_DISPATCHER = 2
+# The first mm-worker that reads the rule "cli", for the same reason.
+CLI_DISPATCHER = 3
+CLIS = ("claude", "opencode")
+OPENCODE_DIRS = (os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".opencode", "bin"),
+                 "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
 
 # Where each provider lists its models: its host variable, and the path below it.
 # Claude isn't here, as a subscription has no key this could ask with.
@@ -683,6 +688,23 @@ class WorkerStreams:
                 report[key] = state[key]
         return report
 
+    def _opencode_line(self, event, state):
+        if event.get("sessionID"):
+            state["sessionId"] = event["sessionID"]
+        part = event.get("part")
+        if not isinstance(part, dict):
+            return
+        if event["type"] == "step_finish":
+            if part.get("messageID"):
+                state["messages"].add(part["messageID"])
+        elif part.get("tool"):
+            state["lastTool"] = part["tool"]
+            status = part.get("state") if isinstance(part.get("state"), dict) else {}
+            given = status.get("input") if isinstance(status.get("input"), dict) else {}
+            target = given.get("filePath")
+            # The name only: enough to see what it is working on.
+            state["lastFile"] = os.path.basename(target) if isinstance(target, str) else ""
+
     def forget_except(self, paths):
         for path in list(self.states):
             if path not in paths:
@@ -706,7 +728,9 @@ class WorkerStreams:
 
     def _line(self, line, state):
         # Tool results make up most of a stream, and they can be huge.
-        if b'"assistant"' not in line[:200] and b'"init"' not in line[:200]:
+        head = line[:200]
+        if (b'"assistant"' not in head and b'"init"' not in head and b'"tool_use"' not in head
+                and b'"step_finish"' not in head):
             return
         try:
             event = json.loads(line)
@@ -716,6 +740,9 @@ class WorkerStreams:
             return
         if event.get("session_id"):
             state["sessionId"] = event["session_id"]
+        if event.get("type") in ("tool_use", "step_finish"):
+            self._opencode_line(event, state)
+            return
         if event.get("type") == "system" and event.get("model"):
             state["model"] = event["model"]
         if event.get("type") != "assistant":
@@ -973,9 +1000,13 @@ def rules_error(rules):
     """
     if not isinstance(rules, dict):
         return "the rules must be a JSON object"
-    error = _key_error(rules, "the rules", ("version", "revision", "balance", "order", "providers", "levels", "defaults"))
+    # cli is optional, and absent means claude, so the defaults stay as they were.
+    required = {key: value for key, value in rules.items() if key != "cli"}
+    error = _key_error(required, "the rules", ("version", "revision", "balance", "order", "providers", "levels", "defaults"))
     if error:
         return error
+    if rules.get("cli", "claude") not in CLIS:
+        return "cli must be one of " + ", ".join(CLIS)
     if not _whole(rules["version"]) or rules["version"] != 1:
         return "version must be 1"
     if not _whole(rules["revision"]) or rules["revision"] < 0:
@@ -1118,6 +1149,15 @@ def claude_installed():
     for folder in os.environ.get("PATH", "").split(os.pathsep) + list(CLAUDE_DIRS):
         path = os.path.join(folder, "claude")
         # A relative PATH entry would depend on where ssh started us.
+        if os.path.isabs(folder) and os.path.isfile(path) and os.access(path, os.X_OK):
+            return True
+    return False
+
+
+def opencode_installed():
+    """Whether an `opencode` command exists. It is never run."""
+    for folder in os.environ.get("PATH", "").split(os.pathsep) + list(OPENCODE_DIRS):
+        path = os.path.join(folder, "opencode")
         if os.path.isabs(folder) and os.path.isfile(path) and os.access(path, os.X_OK):
             return True
     return False
@@ -1300,6 +1340,10 @@ def rules_set(encoded, expected):
         return {"ok": False, "error": error}
     if uses_full_names(rules) and dispatcher_version()[1] < FULL_NAMES_DISPATCHER:
         return {"ok": False, "error": "this machine's mm-worker is too old for these models: update it first"}
+    if "cli" in rules and dispatcher_version()[1] < CLI_DISPATCHER:
+        return {"ok": False, "error": "this machine's mm-worker is too old to choose a CLI: update it first"}
+    if rules.get("cli") == "opencode" and not opencode_installed():
+        return {"ok": False, "error": "opencode isn't installed on this machine"}
     return write_rules(rules, int(expected))
 
 

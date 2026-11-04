@@ -16,6 +16,7 @@ enum FleetRulesText {
         case .revision: return language.t("fleet.rules.issue.revision")
         case .balance: return language.t("fleet.rules.issue.balance")
         case .order: return language.t("fleet.rules.issue.order")
+        case .cli: return language.t("fleet.rules.issue.cli")
         case .unknownProvider(let provider):
             return language.t("fleet.rules.issue.unknownProvider", provider)
         case .slots(let provider):
@@ -417,6 +418,27 @@ struct FleetRulesSection: View {
 
     private func options(_ rules: FleetRules) -> some View {
         HStack(alignment: .top, spacing: 24) {
+            VStack(alignment: .leading, spacing: 6) {
+                heading("fleet.rules.cli")
+                Picker(selection: Binding(
+                    get: { rules.cli ?? "claude" },
+                    // Absent stays absent: claude is the default, and an older mm-worker rejects the key.
+                    set: { value in store.editRules(on: state) { $0.cli = value == "claude" ? nil : value } }
+                )) {
+                    ForEach(FleetRules.clis, id: \.self) { cli in
+                        Text(verbatim: cli).tag(cli)
+                    }
+                } label: { EmptyView() }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                    .disabled(!canEdit)
+                Text(language.t("fleet.rules.cli.help"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: 240, alignment: .leading)
+            }
             VStack(alignment: .leading, spacing: 6) {
                 heading("fleet.rules.balance")
                 Picker(selection: Binding(

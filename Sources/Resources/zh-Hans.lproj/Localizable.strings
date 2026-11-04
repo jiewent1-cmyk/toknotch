@@ -290,6 +290,9 @@
 "fleet.rules.issue.emptyLevel" = "“%@”级别至少需要一个提供商。";
 "fleet.rules.issue.levelProvider" = "“%1$@”级别使用了未列出的提供商：%2$@。";
 "fleet.rules.issue.model" = "“%1$@”级别使用了 %2$@ 不提供的模型。";
+"fleet.rules.issue.cli" = "这台机器的规则指定了本 App 不认识的 CLI。";
+"fleet.rules.cli" = "Agent CLI";
+"fleet.rules.cli.help" = "opencode 在这台机器上运行 MiniMax、智谱和千问，不能运行 Claude。";
 "fleet.rules.models.source" = "除简称外的模型来自各提供商的 API；Claude 的是内置列表。";
 "fleet.rules.models.failed" = "无法从这台机器读取提供商的模型列表，菜单只显示内置模型。";
 "fleet.rules.models.providerFailed" = "无法读取 %1$@ 的模型列表（%2$@），它的菜单只显示内置模型。";

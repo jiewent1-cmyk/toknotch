@@ -33,6 +33,31 @@ def assistant(ident, when, output, session="s1", model="m1", **extra):
         **extra})
 
 
+class OpencodeStream(unittest.TestCase):
+    """fleet-agent follows opencode's events as it does claude's."""
+
+    def test_progress_comes_from_opencode_events(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home)
+        agent = load_agent(home)
+        path = os.path.join(home, "stream.json")
+        lines = [
+            {"type": "system", "subtype": "init", "model": "MiniMax-M3"},
+            {"type": "tool_use", "sessionID": "ses_1", "part": {"tool": "read", "state": {"input": {"filePath": "/a/b/secret.py"}}}},
+            {"type": "step_finish", "sessionID": "ses_1", "part": {"messageID": "m1", "reason": "tool-calls"}},
+            {"type": "text", "part": {"text": SECRET}},
+        ]
+        with open(path, "w") as handle:
+            handle.write("".join(json.dumps(line) + "\n" for line in lines))
+        report = agent.WorkerStreams().progress(path, time.time())
+        self.assertEqual(report["model"], "MiniMax-M3")
+        self.assertEqual(report["lastTool"], "read")
+        self.assertEqual(report["lastFile"], "secret.py")
+        self.assertEqual(report["sessionId"], "ses_1")
+        self.assertEqual(report["steps"], 1)
+        self.assertNotIn(SECRET, json.dumps(report))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
@@ -882,7 +907,7 @@ class KeyPrivacy(DispatcherBase):
             self.assertNotIn(FAKE_KEY, handle.read())
 
     def test_rules_take_a_full_name_for_its_own_provider_only(self):
-        self.write_dispatcher(2)
+        self.write_dispatcher(3)
         rules = self.rules_with_model("MiniMax-M2.5")
         self.assertIs(self.cli("rules-set", encode(rules), "0")[0]["ok"], True)
         for bad in ("glm-5.1", "m3 ; rm -rf x", "MiniMax-" + "x" * 90):
@@ -898,6 +923,23 @@ class KeyPrivacy(DispatcherBase):
         self.assertIn("too old", answer["error"])
         self.assertFalse(os.path.exists(self.rules_path))
         self.assertIs(self.cli("rules-set", encode(self.rules_with_model("m27")), "0")[0]["ok"], True)
+
+    def test_the_cli_rule_waits_for_a_dispatcher_and_for_opencode(self):
+        rules = copy.deepcopy(self.agent.DEFAULT_RULES)
+        rules["cli"] = "opencode"
+        self.write_dispatcher(2)
+        self.assertIn("too old", self.cli("rules-set", encode(rules), "0")[0]["error"])
+        self.write_dispatcher(3)
+        with mock.patch.dict(os.environ, {"PATH": "/nonexistent"}):
+            if not self.agent.opencode_installed():
+                answer = self.cli("rules-set", encode(rules), "0")[0]
+                self.assertIs(answer["ok"], False)
+        self.put(".local/bin/opencode", "#!/bin/sh\n")
+        os.chmod(os.path.join(self.home, ".local/bin/opencode"), 0o755)
+        self.assertIs(self.cli("rules-set", encode(rules), "0")[0]["ok"], True)
+        self.assertEqual(self.cli("--once")[0]["dispatcher"]["rules"]["cli"], "opencode")
+        rules["cli"] = "nope"
+        self.assertIn("cli must be", self.cli("rules-set", encode(rules), "1")[0]["error"])
 
     def write_dispatcher(self, version):
         self.put(".local/bin/mm-worker", "#!/usr/bin/env python3\nMM_WORKER_VERSION = %d\n" % version)
