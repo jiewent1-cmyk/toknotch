@@ -43,6 +43,20 @@ Some snapshots gain `usageHistory`:
 - At local midnight, what was today moves into `days` without a full rescan being needed
   by the app, and the oldest day drops out.
 
+## opencode
+
+opencode writes no Claude Code logs. Its tokens are in `opencode.db` under
+`$XDG_DATA_HOME/opencode`, or `~/.local/share/opencode`: one `message` row per reply,
+with `modelID` and `tokens` in its `data`. `todayByModel` and `usageHistory` add these
+to the rest, by the model opencode names, on the local day of `time_created`. Tokens
+`reasoning` count as `output`, as opencode's `tokens.total` is the sum of the fields.
+
+The query adds them up afresh, so nothing is remembered and nothing is counted twice.
+It runs only after the database or its write-ahead log changed, at most every 30
+seconds, and opens the database read-only. A database that is missing, busy or not
+understood reports no tokens, or the last ones read, and never stops a snapshot.
+Sessions of opencode are not listed.
+
 ## Cost to the machine
 
 This runs on machines doing other work, some with hundreds of MB of logs and little

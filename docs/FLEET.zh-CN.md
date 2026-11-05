@@ -421,11 +421,11 @@ make test                             # Swift 套件，见下
 - **只有英文、简体中文和繁体中文翻译了 Fleet 的文字。** 其余十三种语言显示
   英文。
 - **用 `-H` 时，目标机器的规则 `cli` 不生效**：任务总是在 `claude` 下运行，和 `mm-remote-run` 一样。
-- **worker 和会话的上报只读 `~/.claude/projects` 下的 Claude Code 日志。**
+- **会话和 worker 列表只读 `~/.claude/projects` 下的 Claude Code 日志。**
   会话和 worker 都是从 Claude Code 自己的会话日志认出来的——`claude` 命令行
-  以及一切驱动它的东西（包括 `mm-worker` 任务）。不往那里写 Claude Code 会话
-  日志的其他编码工具，在 Fleet 的每机器数字里是看不见的，即使环形图统计了它们
-  的 token。
+  以及任何驱动它的工具，包括 `mm-worker` 任务。token 统计还会读 opencode 的数据库，
+  所以 opencode 的 token 会按机器、按模型显示，但它的会话不会列出。两者都不写的其他
+  编码工具，在 Fleet 的单机数字里看不到，即使刘海的圆环统计到了它们的 token。
 - **`make install` 用的是上游作者的 Developer ID**（见上文），而且**本 fork 没有
   发布版、也没有自动更新**：本 fork 的构建里移除了更新源地址（`SUFeedURL`），
   所以 Sparkle 不会启动，也不会把你的构建替换成上游的发布版。

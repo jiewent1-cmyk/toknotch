@@ -87,8 +87,8 @@ With `opencode`:
   since opencode matches by prefix. It still can't limit what `cmd` itself does, so
   `Bash(python3:*)` is as open as running any program.
 - Only on this machine: a task with `-H` runs there under `claude`.
-- Tokens reach the ledger, but Fleet's token counts read Claude Code's logs, so these
-  workers aren't in them.
+- Tokens reach the ledger, and Fleet counts them from opencode's own database. See
+  `docs/FLEET-USAGE.md`.
 
 A rule may also name any model by its full name, as the provider's API lists it:
 up to 80 letters, digits, `.`, `_`, `:` or `-`, starting with `MiniMax-`

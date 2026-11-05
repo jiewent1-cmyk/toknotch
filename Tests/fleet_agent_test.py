@@ -131,6 +131,104 @@ class Usage(Base):
         self.assertEqual(self.report()["todayByModel"]["m1"]["output"], 5)
 
 
+class Opencode(Base):
+    """opencode writes no Claude Code logs; its tokens are in its own database."""
+
+    def database(self, wal=True):
+        import sqlite3
+        folder = os.path.join(self.home, ".local/share/opencode")
+        os.makedirs(folder, exist_ok=True)
+        connection = sqlite3.connect(os.path.join(folder, "opencode.db"))
+        if wal:
+            connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,"
+                           " time_updated INTEGER, data TEXT)")
+        return connection
+
+    @staticmethod
+    def add(connection, ident, when, role="assistant", model="MiniMax-M3", tokens=None):
+        tokens = tokens or {"total": 111, "input": 10, "output": 1, "reasoning": 5,
+                            "cache": {"read": 90, "write": 5}}
+        connection.execute("INSERT INTO message VALUES (?, 's', ?, ?, ?)",
+                           (ident, int(when * 1000), int(when * 1000),
+                            json.dumps({"role": role, "modelID": model, "providerID": "mm", "tokens": tokens,
+                                        "content": "SECRET-TEXT"})))
+        connection.commit()
+
+    def full_report(self):
+        log = self.agent.SessionLog()
+        history = self.agent.UsageHistory()
+        now = time.time()
+        log.scan(now)
+        history.finish(now)
+        return self.agent.snapshot(log, now, history=history)
+
+    EXPECTED = {"input": 10, "output": 6, "cacheRead": 90, "cacheWrite": 5}
+
+    def test_today_and_past_days_count_and_user_messages_do_not(self):
+        now = time.time()
+        yesterday = self.agent._days_back(now, 1, 12)
+        connection = self.database()
+        self.add(connection, "a", now - 1)
+        self.add(connection, "u", now - 1, role="user", tokens={"input": 999})
+        self.add(connection, "b", yesterday, model="glm-5.3-flash")
+        self.add(connection, "old", self.agent._days_back(now, 40, 12))
+        report = self.full_report()
+        self.assertEqual(report["todayByModel"], {"MiniMax-M3": self.EXPECTED})
+        self.assertEqual(report["usageHistory"]["days"],
+                         {self.agent.local_day(yesterday): {"glm-5.3-flash": self.EXPECTED}})
+        self.assertNotIn("SECRET-TEXT", json.dumps(report))
+        connection.close()
+
+    def test_a_database_with_no_write_ahead_log_is_read_and_left_alone(self):
+        connection = self.database()
+        self.add(connection, "a", time.time() - 1)
+        connection.close()  # a clean exit removes the -wal and -shm files
+        folder = os.path.join(self.home, ".local/share/opencode")
+        self.assertEqual(os.listdir(folder), ["opencode.db"])
+        self.assertEqual(self.full_report()["todayByModel"], {"MiniMax-M3": self.EXPECTED})
+        self.assertEqual(os.listdir(folder), ["opencode.db"])
+
+    def test_it_adds_to_claude_codes_tokens_for_the_same_model(self):
+        now = time.time()
+        connection = self.database()
+        self.add(connection, "a", now - 1)
+        usage = self.agent.UsageHistory()
+        usage.opencode = self.agent.OpencodeUsage(os.path.join(self.home, ".local/share/opencode/opencode.db"))
+        log = self.agent.SessionLog()
+        log.report = lambda *_: ([], {"MiniMax-M3": {"input": 1, "output": 1, "cacheRead": 1, "cacheWrite": 1}})
+        report = self.agent.snapshot(log, now, history=usage)
+        self.assertEqual(report["todayByModel"], {"MiniMax-M3": {"input": 11, "output": 7, "cacheRead": 91,
+                                                                 "cacheWrite": 6}})
+        connection.close()
+
+    def test_no_database_or_a_strange_one_reports_nothing(self):
+        self.assertEqual(self.full_report()["todayByModel"], {})
+        folder = os.path.join(self.home, ".local/share/opencode")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "opencode.db"), "w") as handle:
+            handle.write("not a database")
+        self.assertEqual(self.full_report()["todayByModel"], {})
+
+    def test_it_reads_only_after_a_change_and_not_too_often(self):
+        path = os.path.join(self.home, ".local/share/opencode/opencode.db")
+        connection = self.database()
+        self.add(connection, "a", time.time() - 1)
+        usage = self.agent.OpencodeUsage(path)
+        calls = []
+        query = usage._query
+        usage._query = lambda *args: calls.append(1) or query(*args)
+        now = time.time()
+        self.assertTrue(usage.read(now, now - 3600))
+        self.assertFalse(usage.read(now + 1, now - 3600), "too soon")
+        self.assertFalse(usage.read(now + self.agent.OPENCODE_INTERVAL, now - 3600), "nothing changed")
+        self.assertEqual(len(calls), 1)
+        self.add(connection, "b", time.time() - 1)
+        self.assertTrue(usage.read(now + 2 * self.agent.OPENCODE_INTERVAL, now - 3600))
+        self.assertEqual(len(calls), 2)
+        connection.close()
+
+
 class Privacy(Base):
     def test_bodies_and_tool_inputs_never_leave(self):
         self.write("s1.jsonl", assistant("a", self.now, 5))

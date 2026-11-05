@@ -409,7 +409,8 @@ What the agent reports, in its own words: `watch` and `--once` are read-only.
 They report token counts, model names, tool names, the file name a worker
 last touched and a short title per session or worker. They never report
 message bodies, commands or other tool inputs, or anything from credential
-files — those are read only to tell whether a key is set.
+files — those are read only to tell whether a key is set. From opencode's
+database they read only each reply's model, time and token counts.
 
 - **The agent only checks that a key is set.** It reads the key file to check
   that the key variable in `~/.config/<provider>/env` is non-empty and
@@ -481,12 +482,13 @@ Stated plainly:
   Fleet text.** The other thirteen languages show English.
 - **With `-H`, the target's rule `cli` isn't followed**: the task runs under
   `claude`, as `mm-remote-run` does.
-- **Worker and session reporting reads Claude Code logs only**, under
+- **Session and worker lists read Claude Code logs only**, under
   `~/.claude/projects`. Sessions and workers are recognised from Claude
   Code's own session logs — the `claude` CLI and anything that drives it,
-  `mm-worker` tasks included. Other coding tools that do not write Claude
-  Code session logs there are invisible to Fleet's per-machine numbers, even
-  where the rings count their tokens.
+  `mm-worker` tasks included. Token counts also read opencode's database, so
+  opencode's tokens appear per machine and by model although its sessions are
+  not listed. Other coding tools that write neither are invisible to Fleet's
+  per-machine numbers, even where the rings count their tokens.
 - **`make install` signs with the upstream author's Developer ID** (see
   above), and there is **no release of this fork and no auto-update**: the
   feed URL (`SUFeedURL`) is removed from this fork's build, so Sparkle never

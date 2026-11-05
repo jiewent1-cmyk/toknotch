@@ -59,6 +59,17 @@ JOB_WINDOW = 7 * 86400  # older job folders are ignored without being read
 TITLE_LENGTH = 60
 READ_CHUNK = 1 << 20
 HISTORY_DAYS = 29  # past days reported in usageHistory, today not included
+OPENCODE_INTERVAL = 30.0  # least time between two reads of opencode's database
+# tokens.total is all of these added up, so reasoning belongs with output.
+OPENCODE_QUERY = """
+SELECT date(time_created / 1000, 'unixepoch', 'localtime'), json_extract(data, '$.modelID'),
+       sum(json_extract(data, '$.tokens.input')),
+       sum(json_extract(data, '$.tokens.output')) + sum(ifnull(json_extract(data, '$.tokens.reasoning'), 0)),
+       sum(json_extract(data, '$.tokens.cache.read')), sum(json_extract(data, '$.tokens.cache.write'))
+FROM message
+WHERE time_created >= ? AND json_extract(data, '$.role') = 'assistant'
+GROUP BY 1, 2
+"""
 HISTORY_PASS_BYTES = 16 << 20  # most the past-days scan reads in one pass of the main loop
 HISTORY_INTERVAL = 15.0  # least time between two usageHistory sent while the first scan runs
 ACCOUNT_INTERVAL = 60.0  # how often ~/.claude.json is checked
@@ -74,6 +85,8 @@ LINUX_CPU_LABELS = ("tctl", "tdie", "package id 0")
 
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(HOME, ".claude", "projects")
+OPENCODE_DB = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"),
+                           "opencode", "opencode.db")
 CLAUDE_CONFIG = os.path.join(HOME, ".claude.json")
 WORKER_STATE = os.path.join(HOME, ".cache", "mm-worker")
 DISPATCHER = os.path.join(HOME, ".local", "bin", "mm-worker")
@@ -397,6 +410,14 @@ class UsageHistory:
         self.days = None
         self.sent = None
         self.sent_at = None
+        self.opencode = OpencodeUsage()
+
+    def read_opencode(self, now):
+        """Tokens by model today from opencode, as todayByModel counts them."""
+        self._set_day(now)
+        if self.opencode.read(now, self.start_time):
+            self.changed = True
+        return self.opencode.days.get(self.today, {})
 
     def _set_day(self, now):
         today = local_day(now)
@@ -564,6 +585,10 @@ class UsageHistory:
             for record in self.detail.values():
                 if self.start <= record[0] < self.today:
                     _add_counts(days, record[0], record[1], record[2:])
+            for day, models in self.opencode.days.items():
+                if self.start <= day < self.today:
+                    for model, counts in models.items():
+                        _add_counts(days, day, model, counts)
             self.days = {}
             for day in sorted(days):
                 models = {model: dict(zip(("input", "output", "cacheRead", "cacheWrite"), counts))
@@ -588,6 +613,71 @@ class UsageHistory:
             return None
         self.sent, self.sent_at = body, now
         return report
+
+
+class OpencodeUsage:
+    """Tokens per local day and model from opencode's database, for workers and
+    sessions that write no Claude Code logs.
+
+    Opencode keeps a running total per message, so adding them up again is simple
+    and nothing has to be remembered. Only role, model, time and token fields are
+    read. The query runs only after the database changed, and at most every
+    OPENCODE_INTERVAL, as this runs on machines doing other work.
+    """
+
+    def __init__(self, path=None):
+        self.path = path or OPENCODE_DB
+        self.days = {}  # day -> model -> [input, output, cacheRead, cacheWrite]
+        self.stamp = None
+        self.last_read = None
+
+    def _stamp(self):
+        stamp = []
+        for path in (self.path, self.path + "-wal"):
+            try:
+                info = os.stat(path)
+                stamp.append((info.st_mtime, info.st_size))
+            except OSError:
+                stamp.append(None)
+        return stamp
+
+    def read(self, now, start):
+        """Whether the counts changed. Those since the start time, in epoch seconds."""
+        if self.last_read is not None and now - self.last_read < OPENCODE_INTERVAL:
+            return False
+        stamp = self._stamp()
+        if stamp == self.stamp or stamp[0] is None:
+            return False
+        self.last_read = now
+        rows = self._query(start, stamp[1] is not None)
+        if rows is None:
+            return False  # busy or not understood: keep what we have and try again later
+        self.stamp = stamp
+        days = {}
+        for day, model, *counts in rows:
+            if day:
+                _add_counts(days, sys.intern(day), model if isinstance(model, str) and model else "unknown",
+                            [count if isinstance(count, int) else 0 for count in counts])
+        changed = days != self.days
+        self.days = days
+        return changed
+
+    def _query(self, start, has_wal):
+        try:
+            import sqlite3  # some Python builds lack it, and this is not worth failing over
+        except ImportError:
+            return None
+        # A clean exit leaves no write-ahead log, and read-only sqlite can't make the
+        # files it would then want. Nothing is pending in that case, so read the file as it is.
+        uri = "file:%s?%s" % (urllib.parse.quote(self.path), "mode=ro" if has_wal else "immutable=1")
+        try:
+            connection = sqlite3.connect(uri, uri=True, timeout=1)
+            try:
+                return connection.execute(OPENCODE_QUERY, (int(start * 1000),)).fetchall()
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            return None
 
 
 def _add_counts(days, day, model, counts):
@@ -1796,6 +1886,10 @@ def host_info():
 def snapshot(log, now, vitals=None, dispatcher=None, history=None, account=None):
     """One snapshot. usageHistory is in it only when it is news (see UsageHistory.news)."""
     sessions, models = log.report(now, history)
+    if history is not None:
+        for model, counts in history.read_opencode(now).items():
+            bucket = models.setdefault(model, _empty_usage())
+            _add(bucket, dict(zip(("input", "output", "cacheRead", "cacheWrite"), counts)))
     workers = (local_workers(now, log.streams, log.usage_by_session)
                + remote_jobs(now, log.streams, log.usage_by_session))
     live = {worker.pop("stream") for worker in workers if "stream" in worker}
