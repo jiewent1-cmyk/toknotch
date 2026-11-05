@@ -326,13 +326,13 @@ mm-worker --kill 20260612-101502-4311
 `~/.cache/mm-worker/jobs/<运行 id>-<提供商>/`，任务以脱离连接的方式启动，所以
 连接断开——甚至这台机器关机——都不会让它停下。目标失联时 `mm-worker` 会不断
 重试，告诉你之后如何 `--fetch` 或 `--kill`，能连上时就把结果取回来。此时按
-**派活方**机器的槽位和规则计算，因为 worker 记在派出它的那台机器头上；见
+**目标**机器的槽位、规则、key 和冷却状态计算，任务占目标机器的槽，不占本机的；见
 [FLEET-RULES.md](FLEET-RULES.md)。
 
 `-H` 需要目标机器上有一个配套脚本 `~/.local/bin/mm-remote-run`，**而这个脚本不
 在本仓库里**——需要自己手工配置。没有它，`mm-worker -H` 会以退出码 2 结束，提示
-目标连不上或缺少该脚本。mm-worker 先确认脚本存在、可执行、工作目录存在，然后以
-脱离终端的方式运行：
+目标连不上或缺少该脚本。mm-worker 先确认脚本存在、可执行、工作目录存在、目标有 `python3`，然后在目标上等到
+空槽，以脱离终端的方式运行：
 
 ```
 .local/bin/mm-remote-run <提供商> <超时秒数> <工作目录> \
@@ -389,8 +389,8 @@ python3 Tests/mm_worker_test.py       # 88 项；Linux 上全部通过
 make test                             # Swift 套件，见下
 ```
 
-- `mm_worker_test.py` 的远程测试依赖 `setsid`，macOS 上没有这个命令，所以在 macOS
-  上跳过 11 项；其余测试通过。
+- `mm_worker_test.py` 的 `--kill` 测试依赖 `pkill -s`，macOS 上不支持，所以在 macOS
+  上跳过这一项；其余测试通过。
 - Swift 逻辑测试 199 项通过。它们是经 ssh 用一个小运行器跑的，不是 `make test`。
 - 应用与测试目标均可编译。
 - 托管 GUI 的 XCTest **没有**运行：它们需要图形登录会话，而通过 ssh 连到的测试
@@ -420,7 +420,7 @@ make test                             # Swift 套件，见下
   那台机器上有人运行 `claude` 并执行 `/login` 之前，这个提供商上的任务会失败。
 - **只有英文、简体中文和繁体中文翻译了 Fleet 的文字。** 其余十三种语言显示
   英文。
-- **用 `-H` 时，生效的是派活方机器的槽位和规则**，不是目标机器的。
+- **用 `-H` 时，目标机器的规则 `cli` 不生效**：任务总是在 `claude` 下运行，和 `mm-remote-run` 一样。
 - **worker 和会话的上报只读 `~/.claude/projects` 下的 Claude Code 日志。**
   会话和 worker 都是从 Claude Code 自己的会话日志认出来的——`claude` 命令行
   以及一切驱动它的东西（包括 `mm-worker` 任务）。不往那里写 Claude Code 会话

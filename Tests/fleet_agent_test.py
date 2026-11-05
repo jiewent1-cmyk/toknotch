@@ -192,6 +192,34 @@ class Workers(Base):
         self.assertEqual(worker["title"], "任务：改代码")
         self.assertEqual(worker["remoteHost"], "other-box")
 
+    def test_a_task_sent_away_holds_no_slot_here_but_is_still_listed(self):
+        runs = os.path.join(self.home, ".cache/mm-worker/runs")
+        os.makedirs(runs)
+        pid = str(os.getpid())
+        with open(os.path.join(runs, "20261101-1-%s.name" % pid), "w") as handle:
+            handle.write("sent\n")
+        with open(os.path.join(runs, "20261101-1-%s.remote" % pid), "w") as handle:
+            handle.write("other-box .cache/x zhipu\n")
+        with open(os.path.join(runs, "20261101-1-999999.remote"), "w") as handle:
+            handle.write("other-box .cache/y zhipu\n")  # its dispatcher is gone
+        workers = self.report()["workers"]
+        self.assertEqual(len(workers), 1)
+        self.assertEqual((workers[0]["id"], workers[0]["provider"], workers[0]["remoteHost"], workers[0]["title"]),
+                         ("20261101-1-" + pid, "zhipu", "other-box", "sent"))
+
+    def test_a_job_for_another_machine_is_listed_once_though_it_holds_a_slot(self):
+        state = os.path.join(self.home, ".cache/mm-worker")
+        slot = os.path.join(state, "slots/claude/1")
+        job = os.path.join(state, "jobs/20261101-000000-7-claude")
+        os.makedirs(slot)
+        os.makedirs(job)
+        pid = str(os.getpid())
+        for path, text in ((os.path.join(slot, "pid"), pid), (os.path.join(slot, "job"), "x"),
+                           (os.path.join(job, "pid"), pid), (os.path.join(job, "started"), "")):
+            with open(path, "w") as handle:
+                handle.write(text)
+        self.assertEqual([w["id"] for w in self.report()["workers"]], ["20261101-000000-7"])
+
     def test_no_state_directories_is_fine(self):
         self.assertEqual(self.report()["workers"], [])
 

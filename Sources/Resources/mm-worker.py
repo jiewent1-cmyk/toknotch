@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-MM_WORKER_VERSION = 3
+MM_WORKER_VERSION = 4
 
 # mm-worker: runs one non-interactive Claude Code task on one of several
 # providers, chosen by task level and load, and moves to the next provider when
@@ -9,9 +9,13 @@ MM_WORKER_VERSION = 3
 # docs/FLEET-RULES.md together with the state layout under ~/.cache/mm-worker.
 # fleet-agent.py reads that layout, so keep it exact.
 #
+# A task sent to another machine obeys that machine's rules. This file is copied
+# there and run with --remote, so both sides always agree on what the rules mean.
+#
 # Standard library only, Python 3.9 or newer, Linux and macOS.
 
 import errno
+import io
 import json
 import os
 import re
@@ -44,7 +48,7 @@ usage: mm-worker [options] "prompt"
                                    qwen on this machine; after --, only --allowedTools
   -t, --timeout SEC                timeout for one run (default from rules)
   -n, --name NAME                  task name shown in Fleet
-  -H, --host HOST                  run the worker on another machine over ssh
+  -H, --host HOST                  run the worker on another machine over ssh, under its rules
   -C, --rdir DIR                   working folder there (default: this one, relative to home)
   --json                           print the raw result event instead of its text
   --status                         show cooling, slots and recent runs
@@ -162,6 +166,8 @@ LOCK_STALE = 30
 SLOT_GRACE = 5  # a slot folder with no pid yet is being taken, not dead
 RETRY_SLEEP = 30  # between ssh attempts while the other machine is unreachable
 SUBMIT_GIVE_UP = 600
+UNFINISHED_START = 60  # a job folder without a claim: its starter may still be working
+QUEUED_KEEP = 7 * 86400  # what a dispatcher that vanished left in queued/
 POLL_DEFAULT = 20
 OFFLINE_WAIT_DEFAULT = 21600
 
@@ -856,6 +862,7 @@ class Dispatcher(object):
         self.defer = False
         self.pending = None
         self.base_env = dict(os.environ)
+        self.seen_remote_logs = set()
 
     # --- paths and small helpers
 
@@ -1049,6 +1056,11 @@ class Dispatcher(object):
             return ""
 
     def mark_unavailable(self, provider, seconds, reason):
+        """Seconds of None means the cooldown in the rules of the machine doing the work."""
+        if self.o.host:
+            self.remote_call("mark", provider=provider, seconds=seconds, reason=reason)
+            return
+        seconds = self.cooldown if seconds is None else seconds
         with open(os.path.join(self.state, provider + "_unavailable_until"), "w") as handle:
             handle.write("%d\n" % (int(time.time()) + seconds))
         with open(os.path.join(self.state, provider + "_unavailable_reason"), "w") as handle:
@@ -1059,6 +1071,9 @@ class Dispatcher(object):
         """A one-token request, telling spent quota from a bad key or a network fault."""
         if provider == "claude":
             return True
+        if self.o.host:
+            answer = self.remote_call("probe", provider=provider)
+            return bool(answer and answer.get("available"))
         if self.cooling(provider):
             log("%s is cooling down (%s), skipping" % (provider, self.cooling_reason(provider)))
             return False
@@ -1078,7 +1093,7 @@ class Dispatcher(object):
             return True
         shown = "none" if code is None else str(code)
         if code == 402 or QUOTA_RE.search(body):
-            self.mark_unavailable(provider, self.cooldown, "quota used up (HTTP %s)" % shown)
+            self.mark_unavailable(provider, None, "quota used up (HTTP %s)" % shown)
         elif code == 429:
             self.mark_unavailable(provider, 120, "rate limited (HTTP 429), maybe too many parallel runs")
         elif code in (401, 403):
@@ -1237,38 +1252,232 @@ class Dispatcher(object):
             time.sleep(RETRY_SLEEP)
         return True
 
-    def remote_submit(self, provider, alias):
-        job = shlex.quote(self.rjob)
+    # The files --remote works from. Queued tasks ask again every few seconds, so
+    # these travel once rather than with each request.
+    @property
+    def stage(self):
+        return ".cache/mm-worker/queued/" + self.run_id
+
+    def stage_file(self, path, name):
+        started = time.time()
+        command = "mkdir -p %s && cat > %s/%s" % (self.stage, self.stage, name)
+        while True:
+            with open(path, "rb") as source:
+                if self.ssh(command, stdin=source)[0] == 0:
+                    return True
+            if time.time() - started > SUBMIT_GIVE_UP:
+                log("could not reach %s for %d minutes, giving up" % (self.o.host, SUBMIT_GIVE_UP // 60))
+                return False
+            time.sleep(RETRY_SLEEP)
+
+    def stage_task(self):
+        files = [(os.path.abspath(__file__), "mm-worker.py"), (self.prompt_path, "prompt.md")]
+        if self.o.name:
+            files.append((self.run_file(".name"), "name"))
+        return all(self.stage_file(path, name) for path, name in files)
+
+    def remote_call(self, op, **fields):
+        """The target's answer to one request, or None if there is none to be had."""
+        request = dict(fields, op=op, run_id=self.run_id)
+        command = "python3 -I %s/mm-worker.py --remote %s" % (self.stage, shlex.quote(json.dumps(request)))
+        started = time.time()
+        while True:
+            code, output = self.ssh(command, capture=True)
+            if code != 255:
+                break
+            if time.time() - started > SUBMIT_GIVE_UP:
+                log("could not reach %s for %d minutes, giving up" % (self.o.host, SUBMIT_GIVE_UP // 60))
+                return None
+            time.sleep(RETRY_SLEEP)
+        try:
+            answer = json.loads(output.decode("utf-8", "replace").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            answer = None
+        if not isinstance(answer, dict) or code != 0:
+            log("%s gave no usable answer (exit %d); see %s" % (self.o.host, code, self.stderr_path))
+            return None
+        for line in answer.get("log", ()):
+            if line not in self.seen_remote_logs:
+                self.seen_remote_logs.add(line)
+                log("%s: %s" % (self.o.host, line[len("[mm-worker] "):]))
+        if answer.get("state") == "error":
+            log("%s could not take the task: %s" % (self.o.host, answer.get("error")))
+            return None
+        return answer
+
+    def remote_loop(self):
+        o = self.o
+        tried, last_wait_log = [], 0.0
+        while True:
+            answer = self.remote_call(
+                "start", tried=tried, level=self.level, backend=o.backend, timeout=o.timeout, rdir=o.rdir,
+                extra=o.extra, name=bool(o.name),
+                models={"mm_model": o.mm_model, "zp_model": o.zp_model, "qw_model": o.qw_model,
+                        "claude_model": o.claude_model})
+            if answer is None:
+                return 1
+            state = answer["state"]
+            tried = answer.get("tried", tried)
+            if state == "none":
+                log("no enabled provider on %s takes %s tasks" % (o.host, self.level))
+                return 1
+            if state == "unavailable":
+                log("all providers on %s are unavailable" % o.host)
+                return 1
+            if state == "retry":
+                continue
+            if state == "busy":
+                if time.time() - last_wait_log >= 60:
+                    log("all slots on %s are busy (%s), waiting" % (o.host, " ".join(answer["candidates"])))
+                    last_wait_log = time.time()
+                time.sleep(QUEUE_SLEEP)
+                continue
+            provider = answer["provider"]
+            rc = self.run_on(provider, answer)
+            if self.cancelled():
+                log("the task was cancelled; not trying another provider")
+                return 130
+            if rc != FAILOVER:
+                return rc
+            tried = tried + [provider]
+            log("%s failed, trying the next provider" % provider)
+            self.add_failover_note()
+            if o.backend != "auto":
+                return rc
+            if not self.stage_file(self.prompt_path, "prompt.md"):
+                return 1
+
+    def dispatch_remote(self):
+        self.prepare()
+        if not self.stage_task():
+            return 1
+        rc = self.remote_loop()
+        self.ssh("rm -rf %s" % self.stage)
+        return rc
+
+    # --- the other machine's side: this file running there, with --remote
+
+    def remote_answer(self, request, stage):
+        op = request["op"]
+        provider = request.get("provider")
+        if provider is not None and provider not in PROVIDERS:
+            raise ValueError("unknown provider")
+        if op == "probe":
+            return {"state": "done", "available": self.probe(provider)}
+        if op == "mark":
+            self.mark_unavailable(provider, request["seconds"], request["reason"])
+            return {"state": "done"}
+        if op == "start":
+            return self.remote_start(request, stage)
+        raise ValueError("unknown request")
+
+    def job_name(self, provider):
+        return ".cache/mm-worker/jobs/%s-%s" % (self.run_id, provider)
+
+    def remote_start(self, request, stage):
+        tried = request["tried"]
+        self.sweep_queued()
+        earlier = self.earlier_start(tried)
+        if earlier:
+            return earlier
+        got = None
+        # The same selection as on this machine, so its slots, order and levels all count.
+        self.take_lock()
+        try:
+            candidates = self.candidates()
+            for provider in candidates:
+                if provider in tried:
+                    continue
+                if self.cooling(provider):
+                    tried = tried + [provider]
+                    continue
+                if self.take_slot(provider):
+                    got = provider
+                    break
+        finally:
+            self.release_lock()
+        if not candidates:
+            return {"state": "none", "tried": tried}
+        if not got:
+            state = "busy" if [name for name in candidates if name not in tried] else "unavailable"
+            return {"state": state, "candidates": candidates, "tried": tried}
+        if not self.probe(got):
+            self.release_slot()
+            return {"state": "retry", "tried": tried + [got]}
+        return self.remote_launch(got, stage, tried)
+
+    def earlier_start(self, tried):
+        """A retry after a dropped connection must not start the task twice."""
+        prefix = self.run_id + "-"
+        jobs = os.path.join(self.state, "jobs")
+        for name in os.listdir(jobs):
+            if not name.startswith(prefix) or name[len(prefix):] in tried:
+                continue
+            folder = os.path.join(jobs, name)
+            try:
+                with open(os.path.join(folder, "claim.json")) as handle:
+                    return json.load(handle)
+            except (OSError, ValueError):
+                pass
+            if time.time() - os.stat(folder).st_mtime < UNFINISHED_START:
+                return {"state": "busy", "candidates": [name[len(prefix):]], "tried": tried}
+            shutil.rmtree(folder, ignore_errors=True)
+        return None
+
+    def sweep_queued(self):
+        root = os.path.join(self.state, "queued")
+        for name in os.listdir(root):
+            folder = os.path.join(root, name)
+            try:
+                if time.time() - os.stat(folder).st_mtime > QUEUED_KEEP:
+                    shutil.rmtree(folder, ignore_errors=True)
+            except OSError:
+                pass
+
+    def remote_launch(self, provider, stage, tried):
+        rjob = self.job_name(provider)
+        try:
+            os.mkdir(rjob)
+        except FileExistsError:
+            self.release_slot()
+            return {"state": "busy", "candidates": [provider], "tried": tried}
+        shutil.copyfile(os.path.join(stage, "prompt.md"), os.path.join(rjob, "prompt.md"))
+        if self.o.name:
+            shutil.copyfile(os.path.join(stage, "name"), os.path.join(rjob, "name"))
+        model = self.model_for(provider)
+        alias = ALIASES[provider].get(model, model)
         command = [".local/bin/mm-remote-run", provider, str(self.timeout), self.o.rdir,
                    "--model", alias, "-p", "--output-format", "stream-json", "--verbose"] + self.o.extra
+        job = shlex.quote(rjob)
         # While running, out.json is the event stream Fleet follows; afterwards
         # only the final result line stays, since the stream can be large.
         inner = ("echo $$ > {j}/pid; {cmd} < {j}/prompt.md > {j}/out.json 2> {j}/stderr; c=$?; "
                  "tail -n 1 {j}/out.json > {j}/out.tmp && mv {j}/out.tmp {j}/out.json; "
-                 "echo $c > {j}/rc").format(j=job, cmd=" ".join(shlex.quote(a) for a in command))
-        started = time.time()
-        while True:
-            with open(self.prompt_path, "rb") as prompt:
-                if self.ssh("mkdir -p %s && cat > %s/prompt.md" % (job, job), stdin=prompt)[0] == 0:
-                    break
-            if time.time() - started > SUBMIT_GIVE_UP:
-                log("could not reach %s for %d minutes, giving up" % (self.o.host, SUBMIT_GIVE_UP // 60))
-                return FAILOVER
-            time.sleep(RETRY_SLEEP)
-        if self.o.name:
-            self.ssh("cat > %s/name" % job, data=os.fsencode(self.o.name) + b"\n")
-        # `started` keeps a retry after a dropped connection from starting it twice.
-        # setsid and nohup detach it from ssh, so it outlives this machine going away.
-        launch = ("[ -e {j}/started ] || {{ touch {j}/started; setsid nohup bash -c {inner} "
-                  "> /dev/null 2>&1 < /dev/null & }}").format(j=job, inner=shlex.quote(inner))
-        if not self.ssh_retry(launch):
-            log("could not submit to %s" % self.o.host)
-            return FAILOVER
-        with open(self.run_file(".remote"), "w") as handle:
-            handle.write("%s %s %s\n" % (self.o.host, self.rjob, provider))
-        log("submitted to %s (%s); losing the connection won't stop it. Fetch it later with "
-            "mm-worker --fetch %s" % (self.o.host, self.rjob, self.run_id))
-        return 0
+                 "echo $c > {j}/rc; rm -rf {slot}").format(
+                     j=job, cmd=" ".join(shlex.quote(a) for a in command), slot=shlex.quote(self.slot))
+        claim = {"state": "started", "provider": provider, "model": model, "timeout": self.timeout,
+                 "rjob": rjob}
+        # Nothing may stop this between starting the job and handing it the slot.
+        self.critical(True)
+        try:
+            # A session of its own, so it outlives ssh and this machine's dispatcher.
+            child = subprocess.Popen(["bash", "-c", inner], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
+            open(os.path.join(rjob, "started"), "w").close()
+            with open(os.path.join(rjob, "claim.tmp"), "w") as handle:
+                json.dump(claim, handle)
+            os.replace(os.path.join(rjob, "claim.tmp"), os.path.join(rjob, "claim.json"))
+            # From here the job holds the slot, for as long as it runs. Fleet reads
+            # this name to tell it from a worker dispatched on this machine.
+            with open(os.path.join(self.slot, "job"), "w") as handle:
+                handle.write(os.path.basename(rjob) + "\n")
+            with open(os.path.join(self.slot, "pid.tmp"), "w") as handle:
+                handle.write("%d\n" % child.pid)
+            os.replace(os.path.join(self.slot, "pid.tmp"), os.path.join(self.slot, "pid"))
+            self.slot = None
+        finally:
+            self.critical(False)
+        return claim
 
     def remote_wait(self, out, run_id):
         """The remote exit code (a timeout's 137 as 124), or CANCELLED."""
@@ -1316,27 +1525,25 @@ class Dispatcher(object):
             number = 1
         return 124 if number == 137 else number
 
-    def run_remote(self, provider, alias, out):
-        self.rjob = ".cache/mm-worker/jobs/%s-%s" % (self.run_id, provider)
-        rc = self.remote_submit(provider, alias)
-        if rc:
-            self.rjob = None
-            return rc
-        return self.remote_wait(out, self.run_id)
-
     # --- one attempt
 
-    def run_on(self, provider):
+    def run_on(self, provider, claim=None):
         started = time.time()
-        model = self.model_for(provider)
+        model = claim["model"] if claim else self.model_for(provider)
         alias = ALIASES[provider].get(model, model)
         out = self.run_file(".%s.json" % provider)
         label = provider + self.where()
         self.attempt = (label, model, started)
         log("backend=%s (%s) level=%s%s" % (provider, model, self.level,
                                             " host=" + self.o.host if self.o.host else ""))
-        if self.o.host:
-            rc = self.run_remote(provider, alias, out)
+        if claim:
+            self.timeout = claim["timeout"]
+            self.rjob = claim["rjob"]
+            with open(self.run_file(".remote"), "w") as handle:
+                handle.write("%s %s %s\n" % (self.o.host, self.rjob, provider))
+            log("submitted to %s (%s); losing the connection won't stop it. Fetch it later with "
+                "mm-worker --fetch %s" % (self.o.host, self.rjob, self.run_id))
+            rc = self.remote_wait(out, self.run_id)
         else:
             rc = self.run_local(provider, alias, out)
         self.attempt = None
@@ -1367,7 +1574,7 @@ class Dispatcher(object):
             # stderr: stdout is only for the final answer, and another provider gets the task.
             self.show(info, sys.stderr)
             if info["result"] and (info["status"] == "402" or QUOTA_RE.search(info["line"])):
-                self.mark_unavailable(provider, self.cooldown,
+                self.mark_unavailable(provider, None,
                                       "quota used up during the run (status %s)" % info["status"])
             elif info["status"] == "429":
                 self.mark_unavailable(provider, 120, "rate limited during the run (429)")
@@ -1384,9 +1591,10 @@ class Dispatcher(object):
             if not o.rdir:
                 cwd, home = logical_cwd(), os.path.expanduser("~")
                 o.rdir = cwd[len(home) + 1:] if cwd.startswith(home + "/") else cwd
-            check = "test -x .local/bin/mm-remote-run && test -d %s" % shlex.quote(o.rdir)
+            check = ("test -x .local/bin/mm-remote-run && test -d %s && command -v python3 > /dev/null"
+                     % shlex.quote(o.rdir))
             if self.ssh(check)[0] != 0:
-                log("%s is unreachable, or lacks mm-remote-run or the folder %s" % (o.host, o.rdir))
+                log("%s is unreachable, or lacks python3, mm-remote-run or the folder %s" % (o.host, o.rdir))
                 raise Exit(2)
         self.level = o.level or ("simple" if o.mm_model == "fast" else "normal")
         if self.level not in LEVELS:
@@ -1439,7 +1647,18 @@ class Dispatcher(object):
             with open(self.run_file(".name"), "wb") as handle:
                 handle.write(os.fsencode(o.name) + b"\n")
 
+    def add_failover_note(self):
+        with open(self.prompt_path, "rb") as handle:
+            prompt = handle.read()
+        note = FAILOVER_NOTE.encode()
+        if not prompt.startswith(note):
+            with open(self.prompt_path + ".tmp", "wb") as handle:
+                handle.write(note + prompt)
+            os.replace(self.prompt_path + ".tmp", self.prompt_path)
+
     def dispatch(self):
+        if self.o.host:
+            return self.dispatch_remote()
         self.prepare()
         tried, probed, last_wait_log = [], set(), 0.0
         while True:
@@ -1491,13 +1710,7 @@ class Dispatcher(object):
                 return rc
             tried.append(got)
             log("%s failed, trying the next provider" % got)
-            with open(self.prompt_path, "rb") as handle:
-                prompt = handle.read()
-            note = FAILOVER_NOTE.encode()
-            if not prompt.startswith(note):
-                with open(self.prompt_path + ".tmp", "wb") as handle:
-                    handle.write(note + prompt)
-                os.replace(self.prompt_path + ".tmp", self.prompt_path)
+            self.add_failover_note()
             if self.o.backend != "auto":
                 return rc
 
@@ -1598,7 +1811,55 @@ def show_status(rules):
     return 0
 
 
+def remote_main(argument):
+    """One request from a dispatcher on another machine, answered with one JSON line."""
+    captured = sys.stderr = io.StringIO()  # logs go back in the answer
+    dispatcher = None
+    try:
+        request = json.loads(argument)
+        home = os.path.expanduser("~")
+        os.chdir(home)
+        state = os.path.join(home, ".cache", "mm-worker")
+        for folder in ["jobs", "queued"] + [os.path.join("slots", name) for name in PROVIDERS]:
+            os.makedirs(os.path.join(state, folder), exist_ok=True)
+        rules_path = os.path.join(home, ".config", "mm-worker", "rules.json")
+        rules, problem = load_rules(rules_path)
+        if problem:
+            log("ignoring %s (%s), using the default rules" % (home_relative(rules_path), problem))
+        options = Options()
+        options.host = None
+        for field in ("level", "timeout", "rdir"):
+            setattr(options, field, request.get(field))
+        options.backend = request.get("backend", "auto")
+        options.extra = request.get("extra", [])
+        options.name = request.get("name")
+        for field, value in request.get("models", {}).items():
+            setattr(options, field, value)
+        if not RUN_ID_RE.match(request["run_id"]):
+            raise ValueError("bad run id")
+        dispatcher = Dispatcher(options, rules)
+        dispatcher.run_id = request["run_id"]
+        dispatcher.level = options.level
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, dispatcher.on_signal)
+        answer = dispatcher.remote_answer(request, os.path.dirname(os.path.abspath(__file__)))
+    except Interrupted:
+        return 1
+    except Exception as error:  # the dispatcher reports it; a traceback here reaches nobody
+        answer = {"state": "error", "error": "%s: %s" % (type(error).__name__, error)}
+    finally:
+        if dispatcher:
+            dispatcher.release_slot()
+            dispatcher.release_lock()
+    answer["log"] = captured.getvalue().splitlines()
+    sys.stdout.write(json.dumps(answer) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def main(argv):
+    if argv[:1] == ["--remote"] and len(argv) == 2:
+        return remote_main(argv[1])
     if os.environ.get("MM_WORKER_ACTIVE"):
         log("refused: already inside a worker. Nested dispatch is not allowed; do the task directly")
         return 3

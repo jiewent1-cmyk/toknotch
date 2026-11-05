@@ -103,9 +103,19 @@ makes `mm-worker` warn on stderr and use the defaults. It never stops work.
 
 Rules apply to tasks started afterwards. Running workers are not touched.
 
-With `-H`, the dispatching machine's slots and rules apply, as the worker is
-counted where it was dispatched from. The target machine's rules apply only to
-tasks started on it.
+With `-H`, the target machine's rules apply, the same as for a task started on it:
+its slots, `balance`, `order`, `enabled`, `levels` and `defaults`, its keys and its
+cooling. The dispatching machine's rules play no part, and `MM_WORKER_SLOTS_*` and
+`MM_WORKER_COOLDOWN` count only where they are set on the target. Only the rule
+`cli` is not followed: a task sent with `-H` always runs under `claude`.
+
+A sent task holds a slot on the target from before it starts until it ends, and none
+on the dispatching machine. So tasks started on the target and tasks sent to it share
+that machine's limit. Two dispatching machines sending to one target do too.
+
+`mm-worker` doing this sends a copy of itself to the target and runs it with `--remote`,
+so the target needs `python3`, 3.9 or newer, but no particular version of `mm-worker`.
+A task with no free slot asks again every few seconds.
 
 ## What `fleet-agent.py` adds
 
@@ -170,7 +180,8 @@ rename means a running dispatcher keeps its old file.
 
 - `slots/<provider>/<n>/pid`: one folder per live slot, created with an atomic
   `mkdir`, holding the dispatcher's pid. Dead pids are reaped. A folder with no
-  pid yet gets 5 seconds' grace.
+  pid yet gets 5 seconds' grace. For a job sent from another machine it holds the
+  job's pid instead, and `slots/<provider>/<n>/job` names the job's folder.
 - `select.lock`: a folder taken with `mkdir` around choosing a provider and taking
   a slot. Treat it as stale after 30 seconds.
 - `runs/<run_id>.prompt.md`, `.name` (from `-n`), `.stderr`, `.<provider>.json`
@@ -178,7 +189,12 @@ rename means a running dispatcher keeps its old file.
   `.remote` (`<host> <rjob> <provider>`) and `.cancelled`.
 - `run_id` is `YYYYMMDD-HHMMSS-<dispatcher pid>`.
 - `jobs/<run_id>-<provider>/` on a machine running work for another:
-  `prompt.md`, `name`, `pid`, `started`, `out.json`, `stderr`, `rc`.
+  `prompt.md`, `name`, `pid`, `started`, `claim.json`, `out.json`, `stderr`, `rc`.
+  `claim.json` is the answer to the dispatcher, kept so that a retry after a dropped
+  connection doesn't start the task twice.
+- `queued/<run_id>/` on the same machine: `mm-worker.py`, `prompt.md` and `name`,
+  for as long as the dispatcher is working with that machine. Removed after 7 days if
+  it never came back.
 - `<provider>_unavailable_until` (epoch seconds), `<provider>_unavailable_reason`.
 - `ledger.tsv`: one line per run, tab-separated: `YYYY-MM-DD HH:MM:SS`, backend
   (`provider` or `provider@host`), model, status, `<n>s`, `in=<n>`, `out=<n>`,

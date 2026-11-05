@@ -846,7 +846,7 @@ def local_workers(now, streams=None, usage_by_session=None):
     try:
         providers = os.listdir(root)
     except OSError:
-        return workers
+        providers = []
     for provider in providers:
         try:
             slots = os.listdir(os.path.join(root, provider))
@@ -856,6 +856,9 @@ def local_workers(now, streams=None, usage_by_session=None):
             pid_path = os.path.join(root, provider, slot, "pid")
             pid = (_read_text(pid_path) or "").strip()
             if not pid or not _alive(pid):
+                continue
+            # A job run for a dispatcher elsewhere holds this slot too: remote_jobs lists it.
+            if os.path.exists(os.path.join(root, provider, slot, "job")):
                 continue
             run_id = _run_id_for(runs, pid)
             try:
@@ -878,6 +881,39 @@ def local_workers(now, streams=None, usage_by_session=None):
                 _add_progress(worker, stream, streams, usage_by_session or {}, now)
                 worker["stream"] = stream
             workers.append(worker)
+    return workers + _sent_workers(runs, now, {worker["id"] for worker in workers})
+
+
+def _sent_workers(runs, now, seen):
+    """Tasks a live dispatcher here is watching on another machine: they hold no slot here."""
+    workers = []
+    try:
+        names = os.listdir(runs)
+    except OSError:
+        return workers
+    for name in names:
+        if not name.endswith(".remote"):
+            continue
+        run_id = name[: -len(".remote")]
+        if run_id in seen or not _alive(run_id.rsplit("-", 1)[-1]):
+            continue
+        path = os.path.join(runs, name)
+        record = (_read_text(path) or "").split()
+        try:
+            started = os.stat(path).st_mtime
+        except OSError:
+            continue
+        # A pid gets reused in the end, and the record of a finished run stays.
+        if len(record) < 3 or now - started > JOB_WINDOW:
+            continue
+        workers.append({
+            "id": run_id,
+            "provider": record[2],
+            "state": "running",
+            "title": _task_title(os.path.join(runs, run_id + ".name"), os.path.join(runs, run_id + ".prompt.md")),
+            "elapsedSeconds": int(now - started),
+            "remoteHost": record[0],
+        })
     return workers
 
 
@@ -944,11 +980,11 @@ def _cancel_local_worker(run_id):
     """A worker running under mm-worker on this machine."""
     runs = os.path.join(WORKER_STATE, "runs")
     pid = run_id.rsplit("-", 1)[1]
+    if os.path.exists(os.path.join(runs, run_id + ".remote")) and _alive(pid):
+        return {"ok": False, "error": "runs on another machine"}
     slots = glob.glob(os.path.join(WORKER_STATE, "slots", "*", "*", "pid"))
     if not any((_read_text(path) or "").strip() == pid for path in slots) or not _alive(pid):
         return {"ok": False, "error": "not running"}
-    if os.path.exists(os.path.join(runs, run_id + ".remote")):
-        return {"ok": False, "error": "runs on another machine"}
     try:
         command = subprocess.run(["ps", "-o", "command=", "-p", pid], stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, timeout=5).stdout.decode()

@@ -34,7 +34,7 @@ struct FleetRules: Codable, Equatable {
     static let cliDispatcherVersion = 3
 
     /// The `MM_WORKER_VERSION` of the `mm-worker.py` in this app's bundle.
-    static let bundledDispatcherVersion = 3
+    static let bundledDispatcherVersion = 4
     /// The first `mm-worker` that accepts full model names. An older one would
     /// call such rules invalid and silently go back to its defaults.
     static let fullNamesDispatcherVersion = 2

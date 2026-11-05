@@ -90,7 +90,7 @@ each machine runs, installed from the app.
 [`FLEET-USAGE.md`](FLEET-USAGE.md) the one behind the Usage page.
 
 `Tests/fleet_agent_test.py` and `Tests/mm_worker_test.py` run on their own with
-`python3`. The remote tests need `setsid`, so they only run on Linux.
+`python3`. The `--kill` test needs `pkill -s`, so it only runs on Linux.
 
 ## Testing
 

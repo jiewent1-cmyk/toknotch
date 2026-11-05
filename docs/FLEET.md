@@ -368,15 +368,16 @@ prompt and, if given, the name are copied to
 launched detached from the connection, so losing the connection — or shutting
 this machine — does not stop it. `mm-worker` retries while the target is
 unreachable, tells you how to `--fetch` or `--kill` the task, and collects
-the result when it can. The **dispatching** machine's slots and rules apply,
-as the worker is counted where it was dispatched from; see
+the result when it can. The **target** machine's slots, rules, keys and cooling
+apply, and the task holds a slot there, not here; see
 [FLEET-RULES.md](FLEET-RULES.md).
 
 `-H` needs a companion script, `~/.local/bin/mm-remote-run`, on the target,
 **and that script is not in this repository** — set it up by hand. Without it,
 `mm-worker -H` exits 2 saying the target is unreachable or lacks it. mm-worker
-first checks that the script exists and is executable and that the working
-folder exists, then runs, detached:
+first checks that the script exists and is executable, that the working
+folder exists and that the target has `python3`, then waits for a slot there and
+runs, detached:
 
 ```
 .local/bin/mm-remote-run <provider> <timeout-seconds> <working-folder> \
@@ -441,8 +442,8 @@ python3 Tests/mm_worker_test.py       # 88 tests; all pass on Linux
 make test                             # Swift suites; see below
 ```
 
-- The `mm_worker_test.py` remote tests need `setsid`, which macOS does not
-  have, so 11 tests are skipped there; the rest pass.
+- The `--kill` test in `mm_worker_test.py` needs `pkill -s`, which macOS does not
+  have, so it is skipped there; the rest pass.
 - The 199 Swift logic tests pass. They were run with a small runner over ssh,
   not with `make test`.
 - The app and test targets compile.
@@ -478,8 +479,8 @@ Stated plainly:
   someone runs `claude` and `/login` on that machine.
 - **Only English, Simplified Chinese and Traditional Chinese have translated
   Fleet text.** The other thirteen languages show English.
-- **With `-H`, the dispatching machine's slots and rules apply**, not the
-  target's.
+- **With `-H`, the target's rule `cli` isn't followed**: the task runs under
+  `claude`, as `mm-remote-run` does.
 - **Worker and session reporting reads Claude Code logs only**, under
   `~/.claude/projects`. Sessions and workers are recognised from Claude
   Code's own session logs — the `claude` CLI and anything that drives it,

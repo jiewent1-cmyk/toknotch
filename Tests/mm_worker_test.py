@@ -109,7 +109,7 @@ host=$1; shift
 printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
 [ -e "$FAKE_SSH_OFFLINE" ] && exit 255
 cd "$FAKE_REMOTE_HOME" || exit 255
-if [ -e "$FAKE_SSH_FLAKY" ] && [[ "$*" == *setsid* ]]; then
+if [ -e "$FAKE_SSH_FLAKY" ] && [[ "$*" == *'"op": "start"'* ]]; then
   rm -f "$FAKE_SSH_FLAKY"
   HOME="$FAKE_REMOTE_HOME" bash -c "$*"
   exit 255
@@ -129,7 +129,24 @@ case $provider in
   *) exit 2 ;;
 esac
 cd "$workdir" || exit 2
-exec timeout -k 15 "$timeout_s" "$FAKE_BIN/claude" "$@"
+echo "$provider $timeout_s $workdir" >> "$FAKE_LOG/remote-run.log"
+limit=$(PATH=/usr/bin:/bin command -v timeout || echo "$FAKE_BIN/timeout")
+exec "$limit" -k 15 "$timeout_s" "$FAKE_BIN/claude" "$@"
+'''
+
+# For systems without timeout, such as macOS.
+FAKE_TIMEOUT = r'''#!@PYTHON@
+import subprocess, sys
+args = sys.argv[1:]
+if args[0] == "-k":
+    args = args[2:]
+child = subprocess.Popen(args[1:])
+try:
+    sys.exit(child.wait(timeout=float(args[0])))
+except subprocess.TimeoutExpired:
+    child.terminate()
+    child.wait()
+    sys.exit(124)
 '''
 
 
@@ -220,6 +237,7 @@ class Base(unittest.TestCase):
         write(os.path.join(self.bin, "claude"), FAKE_CLAUDE.replace("@PYTHON@", PY), 0o755)
         write(os.path.join(self.bin, "fakesleep"), FAKE_SLEEP.replace("@PYTHON@", PY), 0o755)
         write(os.path.join(self.bin, "ssh"), FAKE_SSH, 0o755)
+        write(os.path.join(self.bin, "timeout"), FAKE_TIMEOUT.replace("@PYTHON@", PY), 0o755)
         write(os.path.join(self.sshbin, "ssh"), FAKE_SSH, 0o755)
         write(os.path.join(self.remote, ".local/bin/mm-remote-run"), FAKE_REMOTE_RUN, 0o755)
         base = "http://127.0.0.1:%d" % SERVER.server_address[1]
@@ -228,6 +246,8 @@ class Base(unittest.TestCase):
         write(os.path.join(self.home, ".config/zhipu/env"),
               "# Zhipu\nZHIPU_API_HOST=%s/zp\nexport ZHIPU_API_KEY=\"key-zhipu\"\n" % base)
         write(os.path.join(self.home, ".config/qwen/env"), "QWEN_API_HOST=%s/qw\nQWEN_API_KEY=key-qwen\n" % base)
+        for name in ("minimax", "zhipu", "qwen"):
+            shutil.copytree(os.path.join(self.home, ".config", name), os.path.join(self.remote, ".config", name))
         SERVER.behaviour = {}
         SERVER.requests = []
         self.env = {
@@ -1057,11 +1077,6 @@ class Rules(Base):
         options = MW.parse_args(["-t", "7"])
         self.assertEqual(MW.Dispatcher(options, rules).timeout, 7)
         self.assertEqual(MW.Dispatcher(MW.Options(), MW.DEFAULT_RULES).timeout, 900)
-        if not shutil.which("setsid"):
-            return  # the part below runs the remote side here, which macOS can't do
-        done = self.mw("-H", "box", "-b", "minimax", "x", env={"PATH": self.sshbin + ":" + SYSTEM_PATH})
-        self.assertEqual(done.returncode, 0, done.stderr.decode())
-        self.assertIn(".local/bin/mm-remote-run minimax 45 proj ", read(self.env["FAKE_SSH_LOG"]))
 
 
 # ---------- environment, arguments, prompt and ledger ----------
@@ -1258,8 +1273,7 @@ class Arguments(Base):
 
 # ---------- remote mode ----------
 
-@unittest.skipUnless(shutil.which("setsid") and shutil.which("timeout") and shutil.which("bash"),
-                     "remote tests need setsid, timeout and bash")
+@unittest.skipUnless(shutil.which("bash"), "remote tests need bash")
 class Remote(Base):
     FAST = {"RETRY_SLEEP": 0.2}
 
@@ -1300,16 +1314,14 @@ class Remote(Base):
                          "box .cache/mm-worker/jobs/%s-minimax minimax\n" % run_id)
         self.assertEqual(self.ledger(), ["minimax@box ok in=150 out=7"])
         self.assertEqual(self.live_slots(), [])
-        launch = [line for line in read(self.env["FAKE_SSH_LOG"]).splitlines() if "setsid" in line]
-        self.assertEqual(len(launch), 1)
-        self.assertIn("mm-remote-run minimax 900 'my proj' --model 'opus[1m]' -p --output-format stream-json "
-                      "--verbose --allowedTools 'Bash(git log:*),Read'", shlex_inner(launch[0]))
+        self.assertEqual(read(os.path.join(self.log, "remote-run.log")), "minimax 900 my proj\n")
+        self.assertEqual(os.listdir(os.path.join(self.remote, ".cache/mm-worker/queued")), [])
 
     def test_started_guard_survives_a_dropped_connection(self):
         write(self.env["FAKE_SSH_FLAKY"], "")
         done = self.mw("-H", "box", "-b", "zhipu", "x", patch=self.FAST)
         self.assertEqual(done.stdout.decode(), "RESULT-from-zhipu\n")
-        launches = [line for line in read(self.env["FAKE_SSH_LOG"]).splitlines() if "setsid" in line]
+        launches = [line for line in read(self.env["FAKE_SSH_LOG"]).splitlines() if '"op": "start"' in line]
         self.assertEqual(len(launches), 2)
         self.assertEqual(len(self.records()), 1)
 
@@ -1342,6 +1354,7 @@ class Remote(Base):
         self.assertEqual(self.ledger(), ["minimax@box fetched(0) in=150 out=7"])
         self.assertEqual(read(os.path.join(self.state, "ledger.tsv")).split("\t")[2], "fetched")
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "--kill needs pkill -s")
     def test_kill_cancels_without_failover(self):
         proc = self.start("-H", "box", "-t", "60", "x", env={"MODE_minimax": "slow"}, patch=self.FAST)
         run_id = self.run_id()
@@ -1395,7 +1408,7 @@ class Remote(Base):
     def test_bad_target_and_unknown_runs(self):
         done = self.mw("-H", "box", "-C", "nowhere", "x")
         self.assertEqual(done.returncode, 2)
-        self.assertIn("lacks mm-remote-run or the folder nowhere", done.stderr.decode())
+        self.assertIn("lacks python3, mm-remote-run or the folder nowhere", done.stderr.decode())
         for flag in ("--fetch", "--kill"):
             for run_id in ("20261101-000000-1", "../../etc"):
                 done = self.mw(flag, run_id)
@@ -1413,11 +1426,146 @@ class Remote(Base):
         self.assertEqual((rc, out), (0, "RESULT-from-minimax\n"))
 
 
-def shlex_inner(launch):
-    """The command inside `bash -c '...'` of the launch text."""
-    import shlex
-    words = shlex.split(launch)
-    return words[words.index("-c") + 1]
+@unittest.skipUnless(shutil.which("bash"), "remote tests need bash")
+class RemoteObeysTheTarget(Base):
+    """With -H, the target's rules, slots, keys and cooling decide. Ours are not consulted."""
+    FAST = {"RETRY_SLEEP": 0.2, "QUEUE_SLEEP": 0.2}
+
+    def setUp(self):
+        Base.setUp(self)
+        self.env["PATH"] = self.sshbin + ":" + SYSTEM_PATH
+        self.target_state = os.path.join(self.remote, ".cache/mm-worker")
+
+    def target_rules(self, change):
+        rules = copy.deepcopy(MW.DEFAULT_RULES)
+        change(rules)
+        write(os.path.join(self.remote, ".config/mm-worker/rules.json"), json.dumps(rules))
+
+    def target_slots(self, provider="*"):
+        return glob.glob(os.path.join(self.target_state, "slots", provider, "*"))
+
+    def peak(self, provider, env, count):
+        procs = [self.start("-H", "box", "-b", provider, "-l", "normal", "task %d" % i, env=env, patch=self.FAST)
+                 for i in range(count)]
+        errors = ""
+        for proc in procs:
+            rc, out, err = self.finish(proc, 60)
+            self.assertEqual((rc, out), (0, "RESULT-from-%s\n" % provider), err)
+            errors += err
+        return max(int(n) for n in read(os.path.join(env["FAKE_PEAK"], provider + ".log")).split()), errors
+
+    def test_the_target_allows_more_than_this_machine(self):
+        self.rules(lambda r: r["providers"]["claude"].update(slots=1))
+        self.target_rules(lambda r: r["providers"]["claude"].update(slots=4))
+        env = {"FAKE_PEAK": os.path.join(self.root, "peak"), "FAKE_SLEEP": "2"}
+        peak, errors = self.peak("claude", env, 4)
+        self.assertEqual(peak, 4)
+        self.assertNotIn("busy", errors)
+
+    def test_the_target_allows_less_than_this_machine(self):
+        self.rules(lambda r: r["providers"]["claude"].update(slots=8))
+        self.target_rules(lambda r: r["providers"]["claude"].update(slots=1))
+        env = {"FAKE_PEAK": os.path.join(self.root, "peak"), "FAKE_SLEEP": "1"}
+        peak, errors = self.peak("claude", env, 3)
+        self.assertEqual(peak, 1)
+        self.assertIn("all slots on box are busy (claude), waiting", errors)
+
+    def test_the_job_holds_a_slot_there_and_none_here(self):
+        proc = self.start("-H", "box", "-b", "minimax", "x", env={"MODE_minimax": "slow", "FAKE_SLOW": "3"},
+                          patch=self.FAST)
+        slot = self.wait_for(lambda: [s for s in self.target_slots("minimax")
+                                      if os.path.exists(os.path.join(s, "job"))], 15, "the target's slot")[0]
+        self.assertEqual(self.live_slots(), [])
+        job = read(os.path.join(slot, "job")).strip()
+        self.wait_for(lambda: os.path.exists(os.path.join(self.target_state, "jobs", job, "pid")), 5, "the pid")
+        self.assertEqual(read(os.path.join(slot, "pid")).strip(),
+                         read(os.path.join(self.target_state, "jobs", job, "pid")).strip())
+        self.assertEqual(self.finish(proc, 30)[0], 0)
+        self.wait_for(lambda: not self.target_slots(), 5, "the slot to be freed")
+
+    def test_a_task_started_there_waits_for_a_job_sent_there(self):
+        self.target_rules(lambda r: r["providers"]["zhipu"].update(slots=1))
+        proc = self.start("-H", "box", "-b", "zhipu", "x", env={"MODE_zhipu": "slow", "FAKE_SLOW": "3"},
+                          patch=self.FAST)
+        self.wait_for(lambda: self.target_slots("zhipu"), 15, "the target's slot")
+        rules, _ = MW.load_rules(os.path.join(self.remote, ".config/mm-worker/rules.json"))
+        home = os.environ.get("HOME")
+        os.environ["HOME"] = self.remote
+        try:
+            dispatcher = MW.Dispatcher(MW.Options(), rules)
+            self.assertEqual(dispatcher.used("zhipu"), 1)
+            self.assertFalse(dispatcher.take_slot("zhipu"))
+        finally:
+            os.environ["HOME"] = home
+        self.assertEqual(self.finish(proc, 30)[0], 0)
+
+    def test_the_target_chooses_provider_and_model(self):
+        self.target_rules(lambda r: r["levels"].update(normal={"claude": "haiku"}))
+        done = self.mw("-H", "box", "x", patch=self.FAST)
+        self.assertEqual(done.stdout.decode(), "RESULT-from-claude\n")
+        self.assertEqual(self.records()[0]["argv"][:2], ["--model", "haiku"])
+        self.assertEqual(self.ledger(), ["claude@box ok in=150 out=7"])
+
+    def test_a_provider_disabled_there_gets_nothing(self):
+        self.rules(lambda r: r["providers"]["zhipu"].update(enabled=False))
+        self.target_rules(lambda r: r["providers"]["minimax"].update(enabled=False))
+        done = self.mw("-H", "box", "x", patch=self.FAST)
+        self.assertEqual(done.stdout.decode(), "RESULT-from-zhipu\n")
+
+    def test_keys_are_looked_for_there(self):
+        shutil.rmtree(os.path.join(self.remote, ".config/minimax"))
+        done = self.mw("-H", "box", "x", patch=self.FAST)
+        self.assertEqual(done.stdout.decode(), "RESULT-from-zhipu\n")
+        shutil.rmtree(os.path.join(self.home, ".config/zhipu"))
+        done = self.mw("-H", "box", "x", patch=self.FAST)
+        self.assertEqual(done.stdout.decode(), "RESULT-from-zhipu\n", "no key here doesn't matter")
+
+    def test_cooling_is_there_not_here(self):
+        write(os.path.join(self.state, "minimax_unavailable_until"), "%d\n" % (time.time() + 600))
+        write(os.path.join(self.target_state, "zhipu_unavailable_until"), "%d\n" % (time.time() + 600))
+        self.target_rules(lambda r: r.update(order=["zhipu", "minimax", "claude"]))
+        done = self.mw("-H", "box", "x", patch=self.FAST)
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+
+    def test_the_timeout_comes_from_the_target(self):
+        self.rules(lambda r: r["defaults"].update(timeoutSeconds=77))
+        self.target_rules(lambda r: r["defaults"].update(timeoutSeconds=45))
+        done = self.mw("-H", "box", "-b", "minimax", "x", patch=self.FAST)
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertEqual(read(os.path.join(self.log, "remote-run.log")), "minimax 45 proj\n")
+
+    def test_a_quota_failure_cools_the_target(self):
+        self.target_rules(lambda r: r["defaults"].update(cooldownSeconds=500))
+        done = self.mw("-H", "box", "x", env={"MODE_minimax": "quota"}, patch=self.FAST)
+        self.assertEqual(done.stdout.decode(), "RESULT-from-zhipu\n", done.stderr.decode())
+        self.assertEqual(self.cooling_files(), [])
+        left = int(read(os.path.join(self.target_state, "minimax_unavailable_until"))) - time.time()
+        self.assertTrue(400 < left <= 500, left)
+
+    def test_invalid_rules_there_warn_here_and_use_the_defaults(self):
+        write(os.path.join(self.remote, ".config/mm-worker/rules.json"), "{nope")
+        self.rules(lambda r: r["levels"].update(normal={"claude": "sonnet"}))
+        done = self.mw("-H", "box", "x", patch=self.FAST)
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+        self.assertIn("box: ignoring ~/.config/mm-worker/rules.json", done.stderr.decode())
+
+    def test_no_provider_there_is_said_plainly(self):
+        self.target_rules(lambda r: r["levels"].update(hard={"qwen": "glm"}))
+        done = self.mw("-H", "box", "-l", "hard", "x", patch=self.FAST)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no enabled provider on box takes hard tasks", done.stderr.decode())
+
+    def test_an_interrupt_while_queued_starts_nothing(self):
+        self.target_rules(lambda r: r["providers"]["claude"].update(slots=1))
+        first = self.start("-H", "box", "-b", "claude", "one", env={"MODE_claude": "slow", "FAKE_SLOW": "3"},
+                           patch=self.FAST)
+        self.wait_for(lambda: self.target_slots("claude"), 15, "the first task")
+        second = self.start("-H", "box", "-b", "claude", "two", patch=self.FAST)
+        self.wait_for(lambda: "busy" in read(second.err_path), 15, "the second task to queue")
+        second.send_signal(signal.SIGTERM)
+        self.assertEqual(self.finish(second, 10)[0], 130)
+        self.assertEqual(self.finish(first, 30)[0], 0)
+        self.assertEqual([record["prompt"] for record in self.records()], ["one\n"])
 
 
 # ---------- the shipped file ----------
@@ -1429,7 +1577,7 @@ class Source(unittest.TestCase):
     def test_header(self):
         lines = self.text.splitlines()
         self.assertEqual(lines[0], "#!/usr/bin/env python3")
-        self.assertEqual(lines[1], "MM_WORKER_VERSION = 3")
+        self.assertEqual(lines[1], "MM_WORKER_VERSION = 4")
 
     def test_python_3_9_grammar(self):
         ast.parse(self.text, feature_version=(3, 9))
