@@ -341,6 +341,8 @@ struct FleetDispatcher: Codable, Equatable {
     var rules: FleetRules
     var rulesValid: Bool
     var providers: [String: FleetProviderStatus]
+    /// `~/.local/bin/mm-remote-run` is executable. Absent from an older agent.
+    var remoteRunner: Bool?
 
     var status: FleetDispatcherStatus {
         FleetDispatcherStatus(installed: installed, version: version)

@@ -1,0 +1,168 @@
+#!/bin/bash
+# mm-remote-run: runs one task that mm-worker on another machine sent here with -H.
+#
+#   mm-remote-run <provider> <timeout-seconds> <working-folder> [claude arguments...]
+#
+# The prompt arrives on stdin. Claude Code's stream goes to stdout, diagnostics to
+# stderr, and its exit code is passed through (124 when the timeout ends the run).
+# See "Running a task on another machine" in docs/FLEET.md. provider_env() in
+# mm-worker.py is the reference for the environment set up here.
+#
+# Keys come only from ~/.config/<provider>/env, and for claude from
+# ~/.claude/oauth-token. Nothing here prints them.
+#
+# Written for bash 3.2, as macOS has no newer one in /bin.
+
+usage() {
+  echo "usage: mm-remote-run minimax|zhipu|qwen|claude TIMEOUT-SECONDS FOLDER [claude arguments...]" >&2
+  exit 2
+}
+
+[ $# -ge 3 ] || usage
+provider=$1 limit=$2 folder=$3
+shift 3
+case $provider in
+  minimax|zhipu|qwen|claude) ;;
+  *) echo "mm-remote-run: unknown provider: $provider" >&2; exit 2 ;;
+esac
+[[ $limit =~ ^[0-9]+$ ]] && [ "$limit" -gt 0 ] || usage
+cd "$folder" 2>/dev/null || { echo "mm-remote-run: no such folder: $folder" >&2; exit 2; }
+
+# What the caller's environment says about a provider must not reach this run:
+# the run would go to the wrong host, or with the wrong key. mm-worker scrubs
+# the same for a local worker.
+for name in $(compgen -e); do
+  case $name in
+    ANTHROPIC_*|API_TIMEOUT_MS|CLAUDE_CODE_MAX_OUTPUT_TOKENS|CLAUDE_QWEN_SESSION) unset "$name" ;;
+  esac
+done
+# A worker must not dispatch work of its own.
+export MM_WORKER_ACTIVE=1
+
+# The value of a shell assignment, quotes removed, as mm-worker's _shell_value
+# reads it. The file is parsed, not sourced, so nothing in it is expanded or run.
+shell_value() {
+  local raw=$1 out="" i=0 n=${#1} char
+  while [ "$i" -lt "$n" ]; do
+    char=${raw:i:1}
+    if [ "$char" = "'" ]; then
+      i=$((i + 1))
+      while [ "$i" -lt "$n" ] && [ "${raw:i:1}" != "'" ]; do
+        out=$out${raw:i:1}
+        i=$((i + 1))
+      done
+      i=$((i + 1))
+    elif [ "$char" = '"' ]; then
+      i=$((i + 1))
+      while [ "$i" -lt "$n" ] && [ "${raw:i:1}" != '"' ]; do
+        if [ "${raw:i:1}" = "\\" ] && [ $((i + 1)) -lt "$n" ]; then
+          case ${raw:i+1:1} in
+            '"'|"\\"|'$'|'`') i=$((i + 1)) ;;
+          esac
+        fi
+        out=$out${raw:i:1}
+        i=$((i + 1))
+      done
+      i=$((i + 1))
+    elif [[ $char == [[:space:]] ]]; then
+      break  # the rest is a comment or another command
+    elif [ "$char" = "\\" ] && [ $((i + 1)) -lt "$n" ]; then
+      out=$out${raw:i+1:1}
+      i=$((i + 2))
+    else
+      out=$out$char
+      i=$((i + 1))
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# Every assignment in the provider's env file, exported, as provider_env() does.
+read_env_file() {
+  local file=$1 line pattern='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+  [ -r "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    if [[ $line =~ $pattern ]]; then
+      export "${BASH_REMATCH[2]}=$(shell_value "${BASH_REMATCH[3]}")" 2>/dev/null
+    fi
+  done < "$file"
+}
+
+if [ "$provider" = claude ]; then
+  # A token from `claude setup-token`, for machines without a login of their own.
+  token=""
+  [ -r "$HOME/.claude/oauth-token" ] && token=$(< "$HOME/.claude/oauth-token")
+  token=${token//[[:space:]]/}
+  [ -n "$token" ] && export CLAUDE_CODE_OAUTH_TOKEN="$token"
+  unset token
+else
+  # A Claude login must never travel to another provider's host.
+  unset CLAUDE_CODE_OAUTH_TOKEN
+  read_env_file "$HOME/.config/$provider/env"
+  # Long replies from these providers take a while.
+  export API_TIMEOUT_MS=3000000
+  case $provider in
+    minimax)
+      export ANTHROPIC_BASE_URL="${MINIMAX_API_HOST}/anthropic"
+      export ANTHROPIC_AUTH_TOKEN="${MINIMAX_API_KEY}"
+      export ANTHROPIC_DEFAULT_OPUS_MODEL="${MM_OPUS:-MiniMax-M3}"
+      export ANTHROPIC_DEFAULT_SONNET_MODEL="${MM_SONNET:-MiniMax-M2.7}"
+      export ANTHROPIC_DEFAULT_HAIKU_MODEL="${MM_HAIKU:-MiniMax-M2.7-highspeed}"
+      export CLAUDE_CODE_MODEL_CAPABILITIES="minimax*=-mid_conv_tool_change"
+      ;;
+    qwen)
+      export ANTHROPIC_BASE_URL="${QWEN_API_HOST}"
+      export ANTHROPIC_AUTH_TOKEN="${QWEN_API_KEY}"
+      export ANTHROPIC_DEFAULT_OPUS_MODEL="${QW_OPUS:-qwen3.8-max[1m]}"
+      export ANTHROPIC_DEFAULT_SONNET_MODEL="${QW_SONNET:-qwen3.8-flash[1m]}"
+      export ANTHROPIC_DEFAULT_HAIKU_MODEL="${QW_HAIKU:-qwen3.6-flash[1m]}"
+      export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${QW_MAX_OUTPUT:-65536}"
+      export CLAUDE_CODE_MODEL_CAPABILITIES="qwen*=-mid_conv_tool_change;glm*=-mid_conv_tool_change;deepseek*=-mid_conv_tool_change;auto=-mid_conv_tool_change"
+      export CLAUDE_CODE_SUBAGENT_MODEL="${QW_SUBAGENT:-sonnet}"
+      ;;
+    zhipu)
+      export ANTHROPIC_BASE_URL="${ZHIPU_API_HOST}"
+      export ANTHROPIC_AUTH_TOKEN="${ZHIPU_API_KEY}"
+      unset ZHIPU_API_KEY
+      # Only GLM-5.3-Flash is used, so every alias points at it.
+      export ANTHROPIC_DEFAULT_OPUS_MODEL="${ZP_OPUS:-glm-5.3-flash}"
+      export ANTHROPIC_DEFAULT_SONNET_MODEL="${ZP_SONNET:-glm-5.3-flash}"
+      export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ZP_HAIKU:-glm-5.3-flash}"
+      export CLAUDE_CODE_MODEL_CAPABILITIES="glm*=-mid_conv_tool_change"
+      export CLAUDE_CODE_SUBAGENT_MODEL="${ZP_SUBAGENT:-sonnet}"
+      ;;
+  esac
+fi
+
+# ssh without a login shell has a thin PATH, so the usual folders are tried too.
+claude=$(command -v claude)
+for candidate in "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude; do
+  [ -n "$claude" ] && break
+  [ -x "$candidate" ] && claude=$candidate
+done
+[ -n "$claude" ] || { echo "mm-remote-run: claude is not installed here" >&2; exit 127; }
+
+if command -v timeout > /dev/null; then
+  exec timeout -k 15 "$limit" "$claude" "$@"
+fi
+# macOS has no timeout. This does the same: TERM at the limit, KILL 15 seconds
+# later if it is still there, and exit 124 as timeout does.
+exec perl -e '
+  use POSIX ":sys_wait_h";
+  my $limit = shift;
+  my $pid = fork();
+  die "mm-remote-run: fork: $!\n" unless defined $pid;
+  if ($pid == 0) { exec { $ARGV[0] } @ARGV or exit 127; }
+  $SIG{ALRM} = sub {
+    kill "TERM", $pid;
+    for (1 .. 150) { exit 124 if waitpid($pid, WNOHANG) > 0; select(undef, undef, undef, 0.1); }
+    kill "KILL", $pid;
+    waitpid($pid, 0);
+    exit 124;
+  };
+  alarm $limit;
+  waitpid($pid, 0);
+  alarm 0;
+  exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
+' "$limit" "$claude" "$@"

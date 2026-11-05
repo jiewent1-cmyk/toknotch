@@ -336,6 +336,7 @@ private struct FleetDeviceDetail: View {
                 models(snapshot)
                 workers(snapshot)
                 sessions(snapshot)
+                FleetSetupSection(state: state, snapshot: snapshot, store: store, language: language)
                 FleetRulesSection(state: state, dispatcher: snapshot.dispatcher,
                                   store: store, language: language)
             }

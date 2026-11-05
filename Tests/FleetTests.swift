@@ -191,7 +191,8 @@ final class FleetTests: XCTestCase {
         Data((String(sample.dropLast()) + ",\"dispatcher\":" + dispatcher + "}").utf8)
     }
 
-    private func dispatcherJSON(_ rules: FleetRules = .defaults, version: Int = 1) throws -> String {
+    private func dispatcherJSON(_ rules: FleetRules = .defaults,
+                                version: Int = FleetRules.bundledDispatcherVersion) throws -> String {
         let encoded = String(decoding: try rules.encoded(), as: UTF8.self)
         return """
         {"installed":true,"version":\(version),"claudeInstalled":true,"rules":\(encoded),"rulesValid":true,\

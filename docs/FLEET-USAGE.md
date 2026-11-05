@@ -57,6 +57,33 @@ seconds, and opens the database read-only. A database that is missing, busy or n
 understood reports no tokens, or the last ones read, and never stops a snapshot.
 Sessions of opencode are not listed.
 
+## codex
+
+codex writes no Claude Code logs either. Its sessions are JSON lines under
+`$CODEX_HOME/sessions`, or `~/.codex/sessions` when `CODEX_HOME` is unset. `todayByModel`
+and `usageHistory` add these to the rest, by model, as they do opencode's.
+
+- One `event_msg` of type `token_count` with a non-null `info` is one reply, and its
+  `last_token_usage` is counted. One whose `total_token_usage` equals the previous one in
+  the same file is a repeat and is skipped.
+- `input` is `input_tokens` less `cached_input_tokens`, `cacheRead` is
+  `cached_input_tokens`, `cacheWrite` is `cache_write_input_tokens`, and `output` is
+  `output_tokens`, which already includes reasoning.
+- The model is that of the latest `turn_context` before the event in the same file, or
+  `unknown`. The day is the local day of the event's `timestamp`.
+- Lines are mostly conversation. Any line containing neither `"token_count"` nor
+  `"turn_context"` is skipped unparsed, and nothing but counts and model names is reported.
+
+The files are read by offset, as Claude Code's are: they share the scan's limit per pass,
+and the first scan is `complete` only once codex's files are read too, with `progress`
+counting their bytes. Each file keeps its own counts, so a file that shrinks or is
+replaced is taken out and read again from the start, never counted twice. Today is kept
+with the past days and simply becomes one at midnight. Between walks, files written in the
+last day are checked every pass, so today's codex tokens stay current. During the first
+scan they appear in `todayByModel` as they are read.
+
+`archived_sessions` is not read.
+
 ## Cost to the machine
 
 This runs on machines doing other work, some with hundreds of MB of logs and little
@@ -65,7 +92,8 @@ memory, so it must not get in their way:
 - Only files with an mtime within the 30-day window are opened.
 - The scan reads at most 16 MiB per pass of the main loop, so live snapshots keep their
   normal rhythm while it runs. Long logs take several passes.
-- Lines without `"usage"` are skipped unparsed, as `SessionLog` does.
+- Lines without `"usage"` are skipped unparsed, as `SessionLog` does, and codex lines without
+  `"token_count"` or `"turn_context"`.
 - After the first scan, per-message detail for past days is dropped wherever that can be
   done without miscounting a later duplicate; memory must not grow without limit.
 - The agent stays read-only. It writes nothing to the machine.

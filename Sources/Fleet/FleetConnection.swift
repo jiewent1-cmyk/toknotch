@@ -55,6 +55,14 @@ enum FleetRulesAnswer: Equatable {
     case failed(FleetCommandFailure)
 }
 
+/// What installing `mm-remote-run` on a machine came to.
+enum FleetRunnerInstall: Equatable {
+    case installed
+    /// The machine has one already, which was left as it is.
+    case alreadyThere
+    case failed(FleetCommandFailure)
+}
+
 /// Collects a command's result from the threads feeding and reading it.
 private final class CommandState: @unchecked Sendable {
     private let lock = NSLock()
@@ -223,22 +231,58 @@ final class FleetConnection: @unchecked Sendable {
         ["rules-reset", String(expectedRevision)]
     }
 
+    /// Takes stdin into `temp`, keeping it only if every byte arrived. The size
+    /// check is there because a dropped connection can look like a normal end of
+    /// input to `cat`, which would install half a file.
+    private static func receiveShellCommand(temp: String, byteCount: Int) -> String {
+        "cat > \(temp)"
+            + " && { [ \"$(wc -c < \(temp) | tr -d ' ')\" = \(byteCount) ] || { rm -f \(temp); exit 1; }; }"
+            + " && chmod 755 \(temp)"
+    }
+
     /// From `docs/FLEET-RULES.md`. The rename means a running dispatcher keeps its
-    /// old file. The size check is there because a dropped connection can look like
-    /// a normal end of input to `cat`, which would install half a file.
+    /// old file.
     static func installShellCommand(byteCount: Int) -> String {
         let temp = "~/.local/bin/.mm-worker.tmp"
-        return "mkdir -p ~/.local/bin && cat > \(temp)"
-            + " && { [ \"$(wc -c < \(temp) | tr -d ' ')\" = \(byteCount) ] || { rm -f \(temp); exit 1; }; }"
-            + " && chmod 755 \(temp) && mv \(temp) ~/.local/bin/mm-worker"
+        return "mkdir -p ~/.local/bin && " + receiveShellCommand(temp: temp, byteCount: byteCount)
+            + " && mv \(temp) ~/.local/bin/mm-worker"
+    }
+
+    /// What the runner install prints, and exits 0 with, when the machine already
+    /// has an `mm-remote-run`.
+    static let runnerPresentMarker = "mm-remote-run: already there"
+
+    /// Installs `mm-remote-run` the same way, except that it never replaces one:
+    /// existing ones are tuned by hand. It looks before reading anything, and
+    /// places the file with `ln`, which refuses an existing name, so one that
+    /// appears during the transfer is kept too.
+    static func runnerInstallShellCommand(byteCount: Int) -> String {
+        let target = "~/.local/bin/mm-remote-run"
+        let temp = "~/.local/bin/.mm-remote-run.tmp"
+        let present = "[ -e \(target) ] || [ -L \(target) ]"
+        return "mkdir -p ~/.local/bin"
+            + " && if \(present); then echo '\(runnerPresentMarker)'; exit 0; fi"
+            + " && " + receiveShellCommand(temp: temp, byteCount: byteCount)
+            + " && if ln \(temp) \(target); then rm -f \(temp);"
+            + " else rm -f \(temp); \(present) || exit 1; echo '\(runnerPresentMarker)'; fi"
     }
 
     /// The command that installs the dispatcher from stdin. Nil for an account
     /// read through someone else's sudo, which stays read-only.
     static func installCommand(for device: FleetDevice, alias: String?,
                                byteCount: Int) -> (path: String, arguments: [String])? {
+        shellCommand(installShellCommand(byteCount: byteCount), for: device, alias: alias)
+    }
+
+    /// The same for `mm-remote-run`.
+    static func runnerInstallCommand(for device: FleetDevice, alias: String?,
+                                     byteCount: Int) -> (path: String, arguments: [String])? {
+        shellCommand(runnerInstallShellCommand(byteCount: byteCount), for: device, alias: alias)
+    }
+
+    private static func shellCommand(_ shell: String, for device: FleetDevice,
+                                     alias: String?) -> (path: String, arguments: [String])? {
         guard device.sudoUser == nil else { return nil }
-        let shell = installShellCommand(byteCount: byteCount)
         guard let alias else { return ("/bin/sh", ["-c", shell]) }
         return ("/usr/bin/ssh", sshArguments(alias: alias, remote: shell))
     }
@@ -321,6 +365,29 @@ final class FleetConnection: @unchecked Sendable {
         guard let (path, arguments) = installCommand(for: device, alias: alias, byteCount: file.count)
         else { return .readOnly }
         return await run(path: path, arguments: arguments, input: file, timeout: installTimeout).failure
+    }
+
+    /// What installing `mm-remote-run` came to. One already there is the
+    /// machine's own and is left alone, which is not a failure.
+    static func runnerInstallOutcome(from result: CommandResult) -> FleetRunnerInstall {
+        // Checked first: the script exits without reading its input, so the
+        // write may have failed, and that is expected.
+        if result.launchError == nil, !result.timedOut, result.status == 0,
+           String(decoding: result.output, as: UTF8.self)
+               .split(whereSeparator: \.isNewline)
+               .contains(where: { String($0) == runnerPresentMarker }) {
+            return .alreadyThere
+        }
+        return result.failure.map(FleetRunnerInstall.failed) ?? .installed
+    }
+
+    /// Puts `file` at `~/.local/bin/mm-remote-run` unless one is there already.
+    static func installRunner(_ file: Data, on device: FleetDevice, alias: String?) async -> FleetRunnerInstall {
+        guard !file.isEmpty else { return .failed(.unavailable) }
+        guard let (path, arguments) = runnerInstallCommand(for: device, alias: alias, byteCount: file.count)
+        else { return .failed(.readOnly) }
+        return runnerInstallOutcome(from: await run(path: path, arguments: arguments, input: file,
+                                                    timeout: installTimeout))
     }
 
     /// Runs one command to its end, feeding it `input`.

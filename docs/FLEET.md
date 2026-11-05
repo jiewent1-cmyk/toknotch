@@ -237,7 +237,42 @@ when it was last heard from. Then:
 - **Sessions** — Claude Code sessions, interactive and worker, busiest
   activity first, from the last six hours: title or project folder, kind,
   model, the tool running now, tokens, and whether the session is active.
-- **Dispatch rules** — the editor described next.
+- **Setup** — the tools found on the machine and what the app suggests for it,
+  described next.
+- **Dispatch rules** — the editor described after that.
+
+### Setup
+
+The Setup section lists the coding tools the machine has — Claude Code,
+opencode and Codex — each with whether it is installed, when it was last used,
+and whether it is signed in. Finding this is read-only: the agent looks for the
+commands and their files and runs none of them. It checks only that a sign-in
+file exists, and never reads one. A login that has expired still counts as
+signed in.
+
+Under the tools is what the app proposes for that machine:
+
+- install the dispatcher, or update it to the version this app carries;
+- install `mm-remote-run`, so other machines can send it tasks with `-H`;
+- run workers with `opencode` when Claude Code isn't installed and opencode is;
+- turn off a provider that can't work there, as it has no key;
+- give a level that would be left with no enabled provider the first enabled
+  one in the order.
+
+Slots, balance, order, timings, models already chosen and providers you turned
+off are never touched, and nothing is ever turned on. **Apply…** shows every
+change and asks first; it applies them in that order to this one machine and
+stops at the first failure. There is no "apply to all", and nothing runs by
+itself. A machine read through someone else's sudo, or one that is offline,
+shows the proposal without the button.
+
+Signing in and API keys are never automated. The section only says what is
+missing — sign in to a tool, or add a key in `~/.config/<provider>/env` — and
+you do that on the machine yourself.
+
+`mm-remote-run` ships with the app, and is installed only where none exists. An
+existing one is never replaced, even by a later setup: the app reports it as
+already there.
 
 ### Dispatch rules
 
@@ -372,8 +407,10 @@ the result when it can. The **target** machine's slots, rules, keys and cooling
 apply, and the task holds a slot there, not here; see
 [FLEET-RULES.md](FLEET-RULES.md).
 
-`-H` needs a companion script, `~/.local/bin/mm-remote-run`, on the target,
-**and that script is not in this repository** — set it up by hand. Without it,
+`-H` needs a companion script, `~/.local/bin/mm-remote-run`, on the target.
+It is in this repository as `Sources/Resources/mm-remote-run` and ships with
+the app, whose Setup section installs it on a machine that has none (see
+[Setup](#setup)). It never replaces one already there. Without it,
 `mm-worker -H` exits 2 saying the target is unreachable or lacks it. mm-worker
 first checks that the script exists and is executable, that the working
 folder exists and that the target has `python3`, then waits for a slot there and

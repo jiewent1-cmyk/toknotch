@@ -27,6 +27,8 @@ struct FleetSnapshot: Decodable, Equatable {
     var claudeAccount: FleetClaudeAccount?
     /// Past days, sent only when they change. See `FleetUsageRecord`.
     var usageHistory: FleetUsageHistory?
+    /// The coding tools found on this machine, by name. Absent from an older agent.
+    var tools: [String: FleetTool]?
 
     /// Today's tokens across every model.
     var todayTotal: Int64 { todayByModel.values.reduce(0) { $0 + $1.total } }
@@ -45,6 +47,16 @@ struct FleetSnapshot: Decodable, Equatable {
     }
 
     var activeSessions: [FleetSession] { ownSessions.filter(\.isActive) }
+}
+
+/// One coding tool as a machine sees it, found without running it.
+struct FleetTool: Codable, Equatable {
+    var installed: Bool
+    var hasData: Bool
+    /// Newest usage data, in epoch seconds.
+    var lastUsed: Double?
+    /// Nil where the machine can't tell, as with a login kept in the Keychain.
+    var signedIn: Bool?
 }
 
 /// How worrying a CPU or temperature reading is.
@@ -223,10 +235,10 @@ enum FleetConfig {
 extension FleetSnapshot {
     private enum CodingKeys: String, CodingKey {
         case agentVersion, host, sessions, todayByModel, workers, dispatcher
-        case claudeAccount, usageHistory
+        case claudeAccount, usageHistory, tools
     }
 
-    /// A `dispatcher`, `claudeAccount` or `usageHistory` that can't be read is
+    /// A `dispatcher`, `claudeAccount`, `usageHistory` or `tools` that can't be read is
     /// treated as absent: the rest of the report is still good, and losing a
     /// whole line would look like a dead link.
     init(from decoder: Decoder) throws {
@@ -239,6 +251,7 @@ extension FleetSnapshot {
         dispatcher = (try? container.decodeIfPresent(FleetDispatcher.self, forKey: .dispatcher)) ?? nil
         claudeAccount = (try? container.decodeIfPresent(FleetClaudeAccount.self, forKey: .claudeAccount)) ?? nil
         usageHistory = (try? container.decodeIfPresent(FleetUsageHistory.self, forKey: .usageHistory)) ?? nil
+        tools = (try? container.decodeIfPresent([String: FleetTool].self, forKey: .tools)) ?? nil
     }
 
     /// Decodes one output line. Nil for anything else ssh or a shell profile

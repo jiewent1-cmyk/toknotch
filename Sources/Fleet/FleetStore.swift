@@ -29,6 +29,18 @@ enum FleetRulesNotice: Equatable {
     case installFailed(FleetCommandFailure)
 }
 
+/// How applying a machine's setup ended, until the next action.
+enum FleetSetupNotice: Equatable {
+    case applied
+    /// Applied, but `mm-remote-run` was already there and was left alone.
+    case appliedRunnerKept
+    /// The rules moved on since the report. Nothing of them was written.
+    case conflict
+    case dispatcherFailed(FleetCommandFailure)
+    case runnerFailed(FleetCommandFailure)
+    case rulesFailed(FleetCommandFailure)
+}
+
 /// Publishes every device's state. Connections run only while something is
 /// looking, so a closed window costs the remote machines nothing.
 @MainActor
@@ -43,6 +55,9 @@ final class FleetStore: ObservableObject {
     @Published private(set) var rulesNotices: [String: FleetRulesNotice] = [:]
     /// Devices whose dispatcher is being replaced.
     @Published private(set) var installing: Set<String> = []
+    /// Devices whose setup is being applied.
+    @Published private(set) var applyingSetup: Set<String> = []
+    @Published private(set) var setupNotices: [String: FleetSetupNotice] = [:]
     /// By device. Read when a device's rules are shown, not with every report.
     @Published private(set) var modelListings: [String: FleetModelListing] = [:]
     @Published private(set) var loadingModels: Set<String> = []
@@ -55,6 +70,7 @@ final class FleetStore: ObservableObject {
     private var users = 0
     private let script: Data?
     private let dispatcherFile: Data?
+    private let runnerFile: Data?
     /// Nil for a fixture, which has no file to write to.
     private let configPath: String?
     private let isFixture: Bool
@@ -67,12 +83,14 @@ final class FleetStore: ObservableObject {
     init(devices: [FleetDevice] = FleetConfig.load(),
          script: Data? = FleetStore.bundledScript(),
          dispatcherFile: Data? = FleetStore.bundledDispatcher(),
+         runnerFile: Data? = FleetStore.bundledRunner(),
          configPath: String = FleetConfig.path,
          usageCachePath: String = FleetUsageCache.path) {
         let cached = FleetUsageCache.load(from: usageCachePath)
         self.devices = devices.map { FleetDeviceState(device: $0, usage: cached[$0.id]) }
         self.script = script
         self.dispatcherFile = dispatcherFile
+        self.runnerFile = runnerFile
         self.configPath = configPath
         accountLimits = FleetConfig.loadAccountLimits(from: configPath)
         isFixture = false
@@ -83,7 +101,7 @@ final class FleetStore: ObservableObject {
     /// Already holds the given states and makes no connections. For previews and
     /// rendering checks. Giving a script and a file shows the controls as enabled.
     init(fixture: [FleetDeviceState], script: Data? = nil, dispatcherFile: Data? = nil,
-         accountLimits: [String: Int] = [:]) {
+         runnerFile: Data? = nil, accountLimits: [String: Int] = [:]) {
         // A fixture that gives only snapshots still shows on the Usage page.
         devices = fixture.map { state in
             var state = state
@@ -94,6 +112,7 @@ final class FleetStore: ObservableObject {
         }
         self.script = script
         self.dispatcherFile = dispatcherFile
+        self.runnerFile = runnerFile
         configPath = nil
         self.accountLimits = accountLimits
         isFixture = true
@@ -110,6 +129,11 @@ final class FleetStore: ObservableObject {
 
     nonisolated static func bundledDispatcher() -> Data? {
         Bundle.main.url(forResource: "mm-worker", withExtension: "py")
+            .flatMap { try? Data(contentsOf: $0) }
+    }
+
+    nonisolated static func bundledRunner() -> Data? {
+        Bundle.main.url(forResource: "mm-remote-run", withExtension: nil)
             .flatMap { try? Data(contentsOf: $0) }
     }
 
@@ -328,6 +352,94 @@ final class FleetStore: ObservableObject {
             installing.remove(id)
             rulesNotices[id] = failure.map(FleetRulesNotice.installFailed) ?? .installed
         }
+    }
+
+    // MARK: Setup
+
+    /// Whether this build carries `mm-remote-run` to install at all.
+    var hasRunnerFile: Bool { runnerFile?.isEmpty == false }
+
+    /// What this machine's last report suggests. Nil before a report, or from an
+    /// agent too old to name its tools.
+    func setupProposal(on state: FleetDeviceState) -> FleetSetupProposal? {
+        state.snapshot.flatMap { FleetSetup.proposal(for: $0) }
+    }
+
+    /// Whether the proposal could be applied now. Unsaved rule edits block one
+    /// that writes rules, as the write would replace what is being edited.
+    func canApplySetup(on state: FleetDeviceState) -> Bool {
+        guard canEditRules(on: state), !applyingSetup.contains(state.id), !installing.contains(state.id),
+              rulesEditors[state.id]?.isSaving != true,
+              let proposal = setupProposal(on: state)
+        else { return false }
+        if proposal.installDispatcher && !hasDispatcherFile { return false }
+        if proposal.installRunner && !hasRunnerFile { return false }
+        if proposal.rules != nil && rulesEditors[state.id]?.isDirty == true { return false }
+        return proposal.installDispatcher || proposal.installRunner || proposal.rules != nil
+    }
+
+    /// Applies what the last report suggests, in the contract's order: dispatcher,
+    /// runner, rules. Stops at the first failure. The view asks first.
+    func applySetup(on state: FleetDeviceState) {
+        guard canApplySetup(on: state), let script, case .live(let alias) = state.link,
+              let proposal = setupProposal(on: state)
+        else { return }
+        let id = state.id, device = state.device
+        let dispatcherFile = self.dispatcherFile ?? Data(), runnerFile = self.runnerFile ?? Data()
+        let holdsRules = proposal.rules != nil
+        applyingSetup.insert(id)
+        setupNotices[id] = nil
+        rulesNotices[id] = nil
+        // Holds the rules editor still, so nothing typed meanwhile is lost to the write.
+        if holdsRules { rulesEditors[id]?.isSaving = true }
+        Task {
+            if proposal.installDispatcher {
+                installing.insert(id)
+                let failure = await FleetConnection.install(dispatcherFile, on: device, alias: alias)
+                installing.remove(id)
+                if let failure {
+                    finishSetup(id, .dispatcherFailed(failure), releasing: holdsRules)
+                    return
+                }
+            }
+            var runnerKept = false
+            if proposal.installRunner {
+                let outcome = await FleetConnection.installRunner(runnerFile, on: device, alias: alias)
+                switch outcome {
+                case .installed:
+                    break
+                case .alreadyThere:
+                    runnerKept = true
+                case .failed(let failure):
+                    finishSetup(id, .runnerFailed(failure), releasing: holdsRules)
+                    return
+                }
+            }
+            if let rules = proposal.rules {
+                let answer = await FleetConnection.setRules(rules, expectedRevision: rules.revision,
+                                                            on: device, alias: alias, script: script)
+                switch answer {
+                case .saved(let revision):
+                    rulesEditors[id]?.draft = rules
+                    rulesEditors[id]?.saved(rules, revision: revision)
+                case .conflict:
+                    // The rules section shows its own conflict notice, as for a save.
+                    settle(answer, for: id)
+                    finishSetup(id, .conflict, releasing: false)
+                    return
+                case .failed(let failure):
+                    finishSetup(id, .rulesFailed(failure), releasing: true)
+                    return
+                }
+            }
+            finishSetup(id, runnerKept ? .appliedRunnerKept : .applied, releasing: false)
+        }
+    }
+
+    private func finishSetup(_ id: String, _ notice: FleetSetupNotice, releasing: Bool) {
+        if releasing { rulesEditors[id]?.isSaving = false }
+        applyingSetup.remove(id)
+        setupNotices[id] = notice
     }
 
     // MARK: Model lists

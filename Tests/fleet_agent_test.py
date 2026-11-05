@@ -7,6 +7,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "Sources/Resources/fleet-agent.py")
 SECRET = "SECRET-BODY-TEXT"
 FAKE_KEY = "sk-FAKE-KEY-7f3a9c0d1e2b"
+# The agent looks for codex in $CODEX_HOME, so one set here must not lead it to real files.
+os.environ.pop("CODEX_HOME", None)
 
 
 def load_agent(home):
@@ -60,6 +62,11 @@ class OpencodeStream(unittest.TestCase):
 
 class Base(unittest.TestCase):
     def setUp(self):
+        # Codex logs are found through CODEX_HOME when it is set: never the real ones.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("CODEX_HOME", None)
         self.home = tempfile.mkdtemp()
         self.saved = os.environ.get("HOME")
         self.agent = load_agent(self.home)
@@ -81,6 +88,183 @@ class Base(unittest.TestCase):
         log = self.agent.SessionLog()
         log.scan(time.time())
         return self.agent.snapshot(log, time.time())
+
+
+class Tools(Base):
+    """`tools` in every snapshot: what is installed, its newest data and sign-in, from files only."""
+
+    def setUp(self):
+        super().setUp()
+        # Nothing this machine has installed or set may show through.
+        self.bin = os.path.join(self.home, "bin")
+        os.makedirs(self.bin)
+        self.agent.CLAUDE_DIRS = self.agent.OPENCODE_DIRS = self.agent.CODEX_DIRS = ()
+        self.agent.OPENCODE_DB = os.path.join(self.home, ".local/share/opencode/opencode.db")
+        self.agent.CODEX_HOMES = (os.path.join(self.home, ".codex"),)
+        patch = mock.patch.dict(os.environ, {"PATH": self.bin})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def put(self, relative, text="", mtime=None, mode=0o644):
+        path = os.path.join(self.home, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+        os.chmod(path, mode)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def tools(self, account=None, keys=None, system="linux"):
+        return self.agent.read_tools(account, keys or {}, system)
+
+    def test_a_bare_machine_has_nothing(self):
+        self.assertEqual(self.tools(), {
+            "claude": {"installed": False, "hasData": False, "lastUsed": None, "signedIn": False},
+            "opencode": {"installed": False, "hasData": False, "lastUsed": None, "signedIn": None},
+            "codex": {"installed": False, "hasData": False, "lastUsed": None, "signedIn": False},
+        })
+
+    def test_every_field_when_every_tool_is_there(self):
+        for name in ("claude", "opencode", "codex"):
+            self.put("bin/" + name, "#!/bin/sh\n", mode=0o755)
+        self.put(".claude/projects/p/old.jsonl", "{}\n", self.now - 900)
+        claude = self.put(".claude/projects/q/sub/new.jsonl", "{}\n", self.now - 100)
+        self.put(".claude/projects/q/newer.txt", "", self.now)  # not a log
+        self.put(".claude/oauth-token", "token\n")
+        self.put(".local/share/opencode/opencode.db", "db", self.now - 300)
+        wal = self.put(".local/share/opencode/opencode.db-wal", "wal", self.now - 200)
+        self.put(".local/share/opencode/auth.json", "{}")
+        codex = self.put(".codex/sessions/2026/11/05/rollout.jsonl", "{}\n", self.now - 50)
+        self.put(".codex/sessions/2026/11/04/rollout.jsonl", "{}\n", self.now - 5000)
+        self.put(".codex/auth.json", "{}")
+        self.assertEqual(self.tools(), {
+            "claude": {"installed": True, "hasData": True, "lastUsed": os.stat(claude).st_mtime, "signedIn": True},
+            "opencode": {"installed": True, "hasData": True, "lastUsed": os.stat(wal).st_mtime, "signedIn": True},
+            "codex": {"installed": True, "hasData": True, "lastUsed": os.stat(codex).st_mtime, "signedIn": True},
+        })
+
+    def test_installed_in_the_usual_folders_and_only_if_executable(self):
+        usual = os.path.join(self.home, "usual")
+        self.agent.CODEX_DIRS = (usual,)
+        self.put("usual/codex", "#!/bin/sh\n", mode=0o644)
+        self.assertFalse(self.tools()["codex"]["installed"])
+        os.chmod(os.path.join(usual, "codex"), 0o755)
+        self.assertTrue(self.tools()["codex"]["installed"])
+        self.assertFalse(self.tools()["claude"]["installed"])
+
+    def test_opencode_database_without_a_log(self):
+        db = self.put(".local/share/opencode/opencode.db", "db", self.now - 300)
+        opencode = self.tools()["opencode"]
+        self.assertEqual((opencode["hasData"], opencode["lastUsed"]), (True, os.stat(db).st_mtime))
+
+    def test_claude_signed_in(self):
+        self.assertIs(self.tools(system="linux")["claude"]["signedIn"], False)
+        self.assertIsNone(self.tools(system="darwin")["claude"]["signedIn"])  # it may be in the Keychain
+        account = {"email": "a@example.com", "plan": None, "organization": None}
+        self.assertIs(self.tools(account=account)["claude"]["signedIn"], True)
+        token = self.put(".claude/oauth-token", "")
+        self.assertIs(self.tools()["claude"]["signedIn"], False)  # an empty token is no login
+        self.put(".claude/oauth-token", "token\n")
+        self.assertIs(self.tools(system="darwin")["claude"]["signedIn"], True)
+        os.unlink(token)
+        self.put(".claude/.credentials.json", "")
+        self.assertIs(self.tools()["claude"]["signedIn"], True)
+
+    def test_opencode_signed_in(self):
+        self.assertIsNone(self.tools()["opencode"]["signedIn"])
+        self.assertIsNone(self.tools(keys={"minimax": False, "zhipu": False})["opencode"]["signedIn"])
+        self.assertIs(self.tools(keys={"minimax": False, "qwen": True})["opencode"]["signedIn"], True)
+        self.put(".local/share/opencode/auth.json", "{}")
+        self.assertIs(self.tools()["opencode"]["signedIn"], True)
+
+    def test_opencode_counts_a_key_the_dispatcher_found(self):
+        self.put(".config/zhipu/env", "ZHIPU_API_KEY=%s\n" % FAKE_KEY)
+        report = self.report()
+        self.assertIs(report["tools"]["opencode"]["signedIn"], True)
+        self.assertNotIn(FAKE_KEY, json.dumps(report))
+
+    def test_codex_signed_in_and_codex_home(self):
+        self.assertIs(self.tools()["codex"]["signedIn"], False)
+        other = os.path.join(self.home, "elsewhere")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": other}):
+            agent = load_agent(self.home)
+        self.assertEqual(sorted(agent.CODEX_HOMES), sorted([other, os.path.join(self.home, ".codex")]))
+        self.agent.CODEX_HOMES = agent.CODEX_HOMES
+        self.put("elsewhere/auth.json", "{}")
+        session = self.put("elsewhere/sessions/2026/11/05/rollout.jsonl", "{}\n", self.now - 10)
+        codex = self.tools()["codex"]
+        self.assertEqual((codex["signedIn"], codex["hasData"], codex["lastUsed"]),
+                         (True, True, os.stat(session).st_mtime))
+
+    def test_no_credential_reaches_the_report_or_is_opened(self):
+        secret = "SECRET-CREDENTIAL-1234"
+        credentials = [
+            self.put(".claude/oauth-token", secret),
+            self.put(".claude/.credentials.json", json.dumps({"token": secret})),
+            self.put(".local/share/opencode/auth.json", json.dumps({"key": secret})),
+            self.put(".codex/auth.json", json.dumps({"OPENAI_API_KEY": secret})),
+            self.put(".config/minimax/env", "MINIMAX_API_KEY=%s\n" % secret),
+        ]
+        self.put(".claude/projects/p/s.jsonl", json.dumps({"text": secret}) + "\n")
+        self.put(".codex/sessions/2026/11/05/rollout.jsonl", json.dumps({"text": secret}) + "\n")
+        opened = []
+        real_open = open
+
+        def spy(path, *args, **kwargs):
+            opened.append(os.path.abspath(str(path)))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", spy):
+            tools = self.tools(keys={"minimax": True})
+        self.assertEqual([path for path in opened if path in credentials], [])
+        self.assertNotIn(secret, json.dumps(tools))
+        report = self.report()
+        self.assertTrue(all(report["tools"][name]["signedIn"] for name in ("claude", "opencode", "codex")))
+        self.assertNotIn(secret, json.dumps(report))
+
+    def test_read_at_most_every_60_seconds(self):
+        cache = self.agent.Tools()
+        dispatcher = self.agent.Dispatcher().read(self.now)
+        first = cache.read(self.now, None, dispatcher)
+        self.assertIs(first["codex"]["signedIn"], False)
+        first["codex"]["signedIn"] = "changed by the caller"
+        self.put(".codex/auth.json", "{}")
+        self.put(".codex/sessions/a.jsonl", "{}\n")
+        later = cache.read(self.now + 59, None, dispatcher)
+        self.assertEqual(later["codex"], {"installed": False, "hasData": False, "lastUsed": None, "signedIn": False})
+        later = cache.read(self.now + 60, None, dispatcher)
+        self.assertEqual((later["codex"]["signedIn"], later["codex"]["hasData"]), (True, True))
+
+    def test_walking_stops_at_the_bound_and_keeps_the_answer_so_far(self):
+        # A large folder changed long ago holds the newest log; a small one changed
+        # since holds an older one. Under the bound only the folder changed last is read.
+        root = os.path.join(self.home, ".claude/projects")
+        shutil.rmtree(root)
+        for index in range(100):
+            self.put(".claude/projects/big/%03d.jsonl" % index, "{}\n", self.now - 100)
+        os.utime(os.path.join(root, "big"), (self.now - 10000, self.now - 10000))
+        recent = self.put(".claude/projects/recent/s.jsonl", "{}\n", self.now - 500)
+        os.utime(os.path.join(root, "recent"), (self.now - 5, self.now - 5))
+        self.assertEqual(self.agent.newest_log(root), self.now - 100)
+        self.agent.TOOLS_WALK_LIMIT = 3  # the two folders, then the one log in the newer
+        with mock.patch.object(self.agent.os, "scandir", wraps=os.scandir) as scandir:
+            claude = self.tools()["claude"]
+        opened = [call.args[0] for call in scandir.call_args_list]
+        self.assertIn(os.path.join(root, "recent"), opened)
+        self.assertNotIn(os.path.join(root, "big"), opened)
+        self.assertEqual((claude["hasData"], claude["lastUsed"]), (True, os.stat(recent).st_mtime))
+        self.assertEqual(self.agent.newest_log(root, 2), None)  # stopped before any log
+
+    def test_every_snapshot_has_tools_and_the_remote_runner(self):
+        report = self.report()
+        self.assertEqual(sorted(report["tools"]), ["claude", "codex", "opencode"])
+        self.assertIs(report["dispatcher"]["remoteRunner"], False)
+        runner = self.put(".local/bin/mm-remote-run", "#!/bin/bash\n", mode=0o644)
+        self.assertIs(self.report()["dispatcher"]["remoteRunner"], False)  # not executable
+        os.chmod(runner, 0o755)
+        self.assertIs(self.report()["dispatcher"]["remoteRunner"], True)
+        self.assertEqual(self.report()["agentVersion"], 6)
 
 
 class Usage(Base):
@@ -129,6 +313,271 @@ class Usage(Base):
     def test_garbage_lines_do_not_stop_the_read(self):
         self.write("s1.jsonl", '{"usage": not json', "[]", '"usage"', assistant("a", self.now, 5))
         self.assertEqual(self.report()["todayByModel"]["m1"]["output"], 5)
+
+
+def codex_context(when, model="gpt-6.1-sol"):
+    return json.dumps({"timestamp": stamp(when), "type": "turn_context",
+                       "payload": {"model": model, "cwd": "/work", "user_instructions": SECRET}})
+
+
+def codex_tokens(when, total, input=17114, cached=16000, output=60, write=0, reasoning=0):
+    """A token_count event; total is its running total, which tells repeats apart."""
+    last = {"input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": write,
+            "output_tokens": output, "reasoning_output_tokens": reasoning, "total_tokens": input + output}
+    running = dict(last, total_tokens=total)
+    return json.dumps({"timestamp": stamp(when), "type": "event_msg", "payload": {
+        "type": "token_count", "info": {"total_token_usage": running, "last_token_usage": last,
+                                        "model_context_window": 258400}}})
+
+
+def codex_message(when, text=SECRET):
+    return json.dumps({"timestamp": stamp(when), "type": "response_item",
+                       "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+
+
+class Codex(Base):
+    """codex writes its own session logs, with one token_count event per reply."""
+
+    EXAMPLE = {"input": 1114, "output": 60, "cacheRead": 16000, "cacheWrite": 0}
+
+    def setUp(self):
+        super().setUp()
+        self.sessions = os.path.join(self.home, ".codex/sessions")
+
+    def codex(self, name, *lines, mode="a"):
+        path = os.path.join(self.sessions, "2026/11/05", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, mode) as handle:
+            handle.write("".join(line + "\n" for line in lines))
+        return path
+
+    def full_report(self, now=None):
+        now = self.now if now is None else now
+        log = self.agent.SessionLog()
+        history = self.agent.UsageHistory()
+        log.scan(now)
+        history.finish(now)
+        return history, self.agent.snapshot(log, now, history=history)
+
+    def test_the_worked_example_counts_cached_input_apart(self):
+        self.codex("a.jsonl", codex_context(self.now - 9), codex_tokens(self.now - 5, total=33469))
+        report = self.full_report()[1]
+        self.assertEqual(report["todayByModel"], {"gpt-6.1-sol": self.EXAMPLE})
+        self.assertEqual(report["usageHistory"]["days"], {})
+
+    def test_conversation_text_never_leaves(self):
+        # The second message names the event it is not, so it is parsed and still left out.
+        self.codex("a.jsonl", codex_context(self.now - 9), codex_message(self.now - 8, FAKE_KEY),
+                   codex_message(self.now - 7, '"token_count" "turn_context" ' + SECRET),
+                   codex_tokens(self.now - 5, total=1))
+        text = json.dumps(self.full_report()[1])
+        self.assertNotIn(SECRET, text)
+        self.assertNotIn(FAKE_KEY, text)
+        self.assertNotIn("/work", text)
+
+    def test_repeats_null_info_bad_lines_and_missing_fields(self):
+        when = self.now - 60
+        no_info = json.dumps({"timestamp": stamp(when), "type": "event_msg",
+                              "payload": {"type": "token_count", "info": None, "rate_limits": {}}})
+        no_last = json.dumps({"timestamp": stamp(when), "type": "event_msg",
+                              "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 7}}}})
+        no_time = json.loads(codex_tokens(when, total=8))
+        del no_time["timestamp"]
+        sparse = json.dumps({"timestamp": stamp(when), "type": "event_msg", "payload": {
+            "type": "token_count", "info": {"last_token_usage": {"output_tokens": 3}}}})
+        self.codex("a.jsonl",
+                   codex_tokens(when, total=1, input=10, cached=0, output=1),  # before any turn_context
+                   codex_context(when, "gpt-a"),
+                   codex_tokens(when, total=2), codex_tokens(when, total=2),  # the same event twice
+                   no_info, '{"token_count": nope', '["turn_context"]', no_last, json.dumps(no_time),
+                   json.dumps({"type": "turn_context", "payload": {"model": 5}}),  # not a name: kept gpt-a
+                   sparse,
+                   codex_context(when, "gpt-b"), codex_tokens(when, total=3, input=5, cached=1, output=2,
+                                                              reasoning=1))
+        self.assertEqual(self.full_report()[1]["todayByModel"], {
+            "unknown": {"input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0},
+            "gpt-a": {"input": 1114, "output": 63, "cacheRead": 16000, "cacheWrite": 0},
+            "gpt-b": {"input": 4, "output": 2, "cacheRead": 1, "cacheWrite": 0}})
+
+    def test_a_repeat_is_only_the_previous_event_in_the_same_file(self):
+        when = self.now - 60
+        self.codex("a.jsonl", codex_context(when), codex_tokens(when, total=5))
+        self.codex("b.jsonl", codex_context(when), codex_tokens(when, total=5), codex_tokens(when, total=6),
+                   codex_tokens(when, total=5))
+        self.assertEqual(self.full_report()[1]["todayByModel"]["gpt-6.1-sol"]["output"], 240)
+
+    def test_past_days_and_today_and_the_window(self):
+        days = [1, 29, 30]
+        lines = [codex_context(days_ago(self.now, 31))]
+        for n in days:
+            lines.append(codex_tokens(days_ago(self.now, n), total=n, write=7))
+        lines.append(codex_tokens(self.now - 1, total=100))
+        self.codex("a.jsonl", *lines)
+        report = self.full_report()[1]
+        expected = dict(self.EXAMPLE, cacheWrite=7)
+        self.assertEqual(report["usageHistory"]["days"], {day_of(days_ago(self.now, n)): {"gpt-6.1-sol": expected}
+                                                          for n in (1, 29)})
+        self.assertEqual(report["todayByModel"], {"gpt-6.1-sol": self.EXAMPLE})
+
+    def test_a_file_with_an_old_mtime_is_not_opened(self):
+        stale = self.codex("old.jsonl", codex_tokens(days_ago(self.now, 5), total=1))
+        fresh = self.codex("new.jsonl", codex_tokens(days_ago(self.now, 5), total=1))
+        then = days_ago(self.now, 31, 0)
+        os.utime(stale, (then, then))
+        real_open = open
+        opened = []
+
+        def spy(path, *args, **kwargs):
+            opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", spy):
+            days = self.full_report()[1]["usageHistory"]["days"]
+        self.assertNotIn(stale, opened)
+        self.assertIn(fresh, opened)
+        self.assertEqual(days[day_of(days_ago(self.now, 5))]["unknown"]["output"], 60)
+
+    def test_lines_split_between_reads_and_a_half_written_last_line(self):
+        self.agent.READ_CHUNK = 7
+        self.agent.WALK_INTERVAL = 0
+        event = codex_tokens(self.now - 5, total=2)
+        path = self.codex("a.jsonl", codex_context(self.now - 9), codex_tokens(self.now - 6, total=1))
+        with open(path, "a") as handle:
+            handle.write(event[:50])
+        history = self.agent.UsageHistory()
+        history.finish(self.now)
+        self.assertEqual(history.read_codex(self.now)["gpt-6.1-sol"][1], 60)  # [input, output, ...]
+        with open(path, "a") as handle:
+            handle.write(event[50:] + "\n")
+        history.step(self.now + 1)
+        self.assertEqual(history.read_codex(self.now + 1)["gpt-6.1-sol"][1], 120)
+
+    def test_growth_is_read_between_walks(self):
+        path = self.codex("a.jsonl", codex_context(self.now - 9), codex_tokens(self.now - 6, total=1))
+        history = self.agent.UsageHistory()
+        history.finish(self.now)
+        self.codex("a.jsonl", codex_tokens(self.now - 1, total=2))
+        os.utime(path, (self.now, self.now))
+        history.step(self.now + 1)  # well before the next walk
+        self.assertEqual(history.read_codex(self.now + 1)["gpt-6.1-sol"][1], 120)
+
+    def test_a_rewritten_or_shrunk_file_is_counted_again_once(self):
+        self.agent.WALK_INTERVAL = 0
+        past = days_ago(self.now, 2)
+        lines = [codex_context(past), codex_tokens(past, total=1), codex_tokens(past, total=2),
+                 codex_tokens(self.now - 5, total=3)]
+        path = self.codex("a.jsonl", *lines)
+        history = self.agent.UsageHistory()
+        history.finish(self.now)
+        self.assertEqual(history.report(self.now)["days"][day_of(past)]["gpt-6.1-sol"]["output"], 120)
+        self.codex("a.jsonl", *lines[:2], mode="w")  # shorter
+        history.step(self.now + 1)
+        self.assertEqual(history.report(self.now + 1)["days"][day_of(past)]["gpt-6.1-sol"]["output"], 60)
+        self.assertEqual(history.read_codex(self.now + 1), {})
+        # Replaced by a new file of the same size: a new inode.
+        other = path + ".tmp"
+        with open(other, "w") as handle:
+            handle.write("".join(line + "\n" for line in [lines[0], codex_tokens(past, total=9)]))
+        os.replace(other, path)
+        history.step(self.now + 2)
+        self.assertEqual(history.report(self.now + 2)["days"][day_of(past)]["gpt-6.1-sol"]["output"], 60)
+        self.assertEqual(sum(len(state["days"]) for state in history.codex.files.values()), 1)
+
+    def test_at_midnight_today_moves_into_days_without_a_rescan(self):
+        midnight = self.agent.local_midnight(self.now)
+        before, after = midnight - 120, midnight + 60
+        path = self.codex("a.jsonl", codex_context(before - 90), codex_tokens(before - 60, total=1))
+        os.utime(path, (before - 60, before - 60))
+        log = self.agent.SessionLog()
+        history = self.agent.UsageHistory()
+        history.finish(before)
+        report = self.agent.snapshot(log, before, history=history)
+        self.assertEqual(report["todayByModel"], {"gpt-6.1-sol": self.EXAMPLE})
+        self.assertEqual(report["usageHistory"]["days"], {})
+        history.codex._read = None  # nothing may be read again
+        history.step(after)
+        report = self.agent.snapshot(log, after, history=history)
+        self.assertEqual(report["todayByModel"], {})
+        self.assertEqual(report["usageHistory"]["days"], {day_of(before): {"gpt-6.1-sol": self.EXAMPLE}})
+
+    def test_complete_and_progress_wait_for_the_codex_scan(self):
+        limit = 64 << 10
+        self.agent.HISTORY_PASS_BYTES = limit
+        self.write("s1.jsonl", assistant("c", days_ago(self.now, 2), 5))  # claude is quick
+        lines = [codex_context(days_ago(self.now, 3))]
+        lines += [codex_tokens(days_ago(self.now, 3), total=n) + " " * 900 for n in range(500)]
+        self.codex("a.jsonl", *lines)
+        history = self.agent.UsageHistory()
+        history.step(self.now)
+        first = history.report(self.now)
+        self.assertFalse(first["complete"])
+        self.assertTrue(0 < first["progress"] < 1, first["progress"])
+        passes = 1
+        while not history.complete:
+            before = history.read_bytes + history.codex.read_bytes
+            history.step(self.now)
+            self.assertLessEqual(history.read_bytes + history.codex.read_bytes - before, limit)
+            passes += 1
+            self.assertLess(passes, 100)
+        self.assertGreater(passes, 5)
+        final = history.report(self.now)
+        self.assertEqual((final["complete"], final["progress"]), (True, 1.0))
+        self.assertEqual(final["days"][day_of(days_ago(self.now, 3))]["gpt-6.1-sol"]["output"], 500 * 60)
+
+    def test_once_finishes_the_codex_scan(self):
+        self.agent.HISTORY_PASS_BYTES = 1 << 10
+        self.codex("a.jsonl", codex_context(days_ago(self.now, 3)),
+                   *[codex_tokens(days_ago(self.now, 3), total=n) for n in range(50)])
+        lines = []
+
+        class Out:
+            def write(self, text):
+                lines.append(json.loads(text))
+
+            def flush(self):
+                pass
+
+        with mock.patch.object(self.agent.time, "sleep", lambda seconds: None), \
+                mock.patch.object(self.agent.os, "nice", lambda n: 0), \
+                mock.patch.object(self.agent.sys, "stdout", Out()):
+            self.assertEqual(self.agent.main(["--once"]), 0)
+        history = lines[0]["usageHistory"]
+        self.assertTrue(history["complete"])
+        self.assertEqual(history["days"][day_of(days_ago(self.now, 3))]["gpt-6.1-sol"]["output"], 3000)
+
+    def test_codex_home_is_followed_when_set(self):
+        self.codex("a.jsonl", codex_tokens(self.now - 5, total=1))
+        other = os.path.join(self.home, "elsewhere")
+        path = os.path.join(other, "sessions/2026/11/05/b.jsonl")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as handle:
+            handle.write(codex_context(self.now - 9, "gpt-elsewhere") + "\n" + codex_tokens(self.now - 5, total=1) + "\n")
+        os.environ["CODEX_HOME"] = other
+        self.assertEqual(list(self.full_report()[1]["todayByModel"]), ["gpt-elsewhere"])
+        del os.environ["CODEX_HOME"]
+        self.assertEqual(list(self.full_report()[1]["todayByModel"]), ["unknown"])
+
+    def test_no_codex_folder_is_complete_with_nothing(self):
+        history, report = self.full_report()
+        self.assertEqual(report["todayByModel"], {})
+        self.assertEqual((report["usageHistory"]["complete"], report["usageHistory"]["progress"]), (True, 1.0))
+        self.assertEqual(history.codex.files, {})
+
+    def test_it_adds_to_claude_and_opencode_for_the_same_model(self):
+        past = days_ago(self.now, 2)
+        self.write("s1.jsonl", assistant("a", self.now - 5, 5, model="gpt-6.1-sol"),
+                   assistant("b", past, 5, model="gpt-6.1-sol"))
+        self.codex("a.jsonl", codex_context(past), codex_tokens(past, total=1), codex_tokens(self.now - 5, total=2))
+        log = self.agent.SessionLog()
+        history = self.agent.UsageHistory()
+        history.opencode.days = {day_of(self.now): {"gpt-6.1-sol": [1, 1, 1, 1]},
+                                 day_of(past): {"gpt-6.1-sol": [1, 1, 1, 1]}}
+        log.scan(self.now)
+        history.finish(self.now)
+        report = self.agent.snapshot(log, self.now, history=history)
+        both = {"input": 1114 + 1 + 1, "output": 60 + 5 + 1, "cacheRead": 16000 + 10 + 1, "cacheWrite": 100 + 1}
+        self.assertEqual(report["todayByModel"], {"gpt-6.1-sol": both})
+        self.assertEqual(report["usageHistory"]["days"], {day_of(past): {"gpt-6.1-sol": both}})
 
 
 class Opencode(Base):
@@ -602,7 +1051,8 @@ class DispatcherReport(DispatcherBase):
         self.assertEqual(sorted(report["providers"]), ["claude", "minimax", "qwen", "zhipu"])
         for provider in report["providers"].values():
             self.assertEqual(provider, {"configured": False, "used": 0, "cooling": False, "coolingReason": ""})
-        self.assertEqual(self.report()["agentVersion"], 5)
+        self.assertEqual(report["remoteRunner"], False)
+        self.assertEqual(self.report()["agentVersion"], 6)
 
     def test_version_comes_from_reading_the_file(self):
         marker = os.path.join(self.home, "ran")
@@ -767,7 +1217,7 @@ class DispatcherReport(DispatcherBase):
 
     def test_once_from_stdin_prints_a_snapshot_with_the_dispatcher(self):
         report, _ = self.cli("--once")
-        self.assertEqual(report["agentVersion"], 5)
+        self.assertEqual(report["agentVersion"], 6)
         self.assertTrue(report["usageHistory"]["complete"])
         self.assertIsNone(report["claudeAccount"])
         self.assertEqual(report["dispatcher"]["rules"], self.agent.DEFAULT_RULES)

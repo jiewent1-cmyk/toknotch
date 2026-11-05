@@ -126,6 +126,7 @@ Every snapshot gains:
   "installed": true,
   "version": 1,
   "claudeInstalled": true,
+  "remoteRunner": true,
   "rules": { "...the effective rules..." },
   "rulesValid": true,
   "providers": {
@@ -141,12 +142,49 @@ Every snapshot gains:
   `mm-worker` declaring `MM_WORKER_VERSION = <n>`. Find this by reading the file,
   not by running it. A file without that line is the older shell version:
   `installed` true, `version` 0.
+- `remoteRunner`: `~/.local/bin/mm-remote-run` exists and is executable, so the
+  machine can take tasks sent with `-H`. It is never run. Since `AGENT_VERSION` 6.
 - `configured`: the env file exists and defines a non-empty key variable
   (`MINIMAX_API_KEY`, `ZHIPU_API_KEY`, `QWEN_API_KEY`). The value itself is never
   reported. `claude` counts as configured when `claudeInstalled` is true.
 - `used`: live slots, the same count `mm-worker --status` shows.
 - `cooling`: `<provider>_unavailable_until` is in the future. `coolingReason` is
   the text of `<provider>_unavailable_reason`.
+
+Every snapshot also gains `tools`, since `AGENT_VERSION` 6:
+
+```json
+"tools": {
+  "claude":   {"installed": true,  "hasData": true,  "lastUsed": 1793865706.1, "signedIn": true},
+  "opencode": {"installed": true,  "hasData": true,  "lastUsed": 1793865706.1, "signedIn": null},
+  "codex":    {"installed": false, "hasData": false, "lastUsed": null,         "signedIn": false}
+}
+```
+
+Found from file names, sizes and times only. No tool's command is run, so there
+is no version, and no credential file is opened.
+
+- `installed`: the command is on `PATH` or in that tool's usual folders
+  (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, plus
+  `~/.opencode/bin` for opencode and `~/.npm-global/bin` for codex).
+- `hasData`, `lastUsed`: whether there is usage data, and the newest one's mtime in
+  epoch seconds, or `null`. claude: `*.jsonl` under `~/.claude/projects`. opencode:
+  its database and its `-wal`. codex: `*.jsonl` under `sessions` in `$CODEX_HOME`
+  and `~/.codex`.
+- `signedIn`: `true`, `false`, or `null` for "can't tell".
+  - claude: `true` if `~/.claude/oauth-token` is non-empty, `~/.claude/.credentials.json`
+    exists, or `claudeAccount` is known. Otherwise `null` on macOS, where the login
+    may be in the Keychain, and `false` elsewhere.
+  - opencode: `true` if `auth.json` exists beside its database, or `minimax`,
+    `zhipu` or `qwen` above is `configured`. Otherwise `null`, as opencode can take keys from
+    elsewhere.
+  - codex: `true` if `auth.json` exists in `$CODEX_HOME` or `~/.codex`. Otherwise
+    `false`.
+  - A login that has expired or been revoked still reads `true`: only the tool
+    itself can tell.
+- Read at most every 60 seconds. Looking for the newest log visits at most 20000
+  folder entries, folders changed last first, and keeps the newest found by then,
+  so a large log folder never holds up a snapshot.
 
 New commands. Each prints one JSON line and exits 0, including on refusal:
 

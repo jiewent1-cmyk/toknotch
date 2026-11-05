@@ -9,7 +9,9 @@ by itself once the ssh connection goes away, because its next write fails.
 (see docs/FLEET-USAGE.md), model names, tool names, the file name a worker last
 touched, a short title per session or worker, the OS account name and, from
 `~/.claude.json`, the Claude account's email, plan name and organization name.
-Nothing else from that file is reported. They never report message bodies,
+Nothing else from that file is reported. They also say which of claude,
+opencode and codex are installed, when each last wrote usage data and whether
+each looks signed in, from file names and times only. They never report message bodies,
 commands or other tool inputs, or anything from credential files: those are read
 only to tell whether a key is set.
 
@@ -43,7 +45,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = 5
+AGENT_VERSION = 6
 SCAN_INTERVAL = 2.0  # how often known session files are checked for growth
 WALK_INTERVAL = 15.0  # how often the tree is walked for new session files
 HEARTBEAT = 5.0  # longest gap between snapshots, so CPU and temperature stay current
@@ -74,6 +76,8 @@ HISTORY_PASS_BYTES = 16 << 20  # most the past-days scan reads in one pass of th
 HISTORY_INTERVAL = 15.0  # least time between two usageHistory sent while the first scan runs
 ACCOUNT_INTERVAL = 60.0  # how often ~/.claude.json is checked
 ACCOUNT_LIMIT = 32 << 20  # a bigger ~/.claude.json is not read
+TOOLS_INTERVAL = 60.0  # how often installed tools, their logs and sign-ins are checked
+TOOLS_WALK_LIMIT = 20000  # most folder entries one look for a tool's newest log may visit
 
 # Where Linux publishes CPU and sensor data. Tests point these at a fixture.
 PROC_STAT = "/proc/stat"
@@ -90,6 +94,7 @@ OPENCODE_DB = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME,
 CLAUDE_CONFIG = os.path.join(HOME, ".claude.json")
 WORKER_STATE = os.path.join(HOME, ".cache", "mm-worker")
 DISPATCHER = os.path.join(HOME, ".local", "bin", "mm-worker")
+REMOTE_RUNNER = os.path.join(HOME, ".local", "bin", "mm-remote-run")
 RULES_DIR = os.path.join(HOME, ".config", "mm-worker")
 RULES_PATH = os.path.join(RULES_DIR, "rules.json")
 RULES_LOCK = os.path.join(RULES_DIR, ".rules.lock")
@@ -131,6 +136,12 @@ CLI_DISPATCHER = 3
 CLIS = ("claude", "opencode")
 OPENCODE_DIRS = (os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".opencode", "bin"),
                  "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
+CODEX_DIRS = (os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".npm-global", "bin"),
+              "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
+# Codex keeps its sessions and login in $CODEX_HOME, which defaults to ~/.codex.
+# Both are looked at, as ssh may not pass on the variable a login shell sets.
+CODEX_HOMES = tuple(sorted({os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"),
+                            os.path.join(HOME, ".codex")}))
 
 # Where each provider lists its models: its host variable, and the path below it.
 # Claude isn't here, as a subscription has no key this could ask with.
@@ -386,7 +397,8 @@ class UsageHistory:
     Separate from SessionLog, which reads only today's files and must stay
     quick. The first scan reads every file touched within the window, at most
     HISTORY_PASS_BYTES per step, so a long log never holds up a live snapshot.
-    Later steps read only what files gained.
+    Later steps read only what files gained. Codex's logs (CodexUsage) share
+    that budget, and the first scan is complete only when both are read.
 
     Today's messages are kept too, so that at midnight they move into the past
     days without a rescan. Days before yesterday keep only totals and the ids
@@ -411,6 +423,7 @@ class UsageHistory:
         self.sent = None
         self.sent_at = None
         self.opencode = OpencodeUsage()
+        self.codex = CodexUsage()
 
     def read_opencode(self, now):
         """Tokens by model today from opencode, as todayByModel counts them."""
@@ -418,6 +431,11 @@ class UsageHistory:
         if self.opencode.read(now, self.start_time):
             self.changed = True
         return self.opencode.days.get(self.today, {})
+
+    def read_codex(self, now):
+        """Tokens by model today from codex, as far as step has read them."""
+        self._set_day(now)
+        return self.codex.days.get(self.today, {})
 
     def _set_day(self, now):
         today = local_day(now)
@@ -433,6 +451,7 @@ class UsageHistory:
         for path in [path for path, state in self.files.items() if state["mtime"] < self.start_time]:
             del self.files[path]
         self.queue = [path for path in self.queue if path in self.files]
+        self.codex.set_day(self.today, self.start, self.start_time)
         self._compact()
         self.changed = True
 
@@ -503,7 +522,13 @@ class UsageHistory:
                 left -= used
             if finished:
                 self.queue.pop(0)
-        if not self.complete and self.walked and not self.queue:
+        # Codex shares the pass's budget. It is walked on the first pass even with
+        # none left, so progress counts its bytes from the start.
+        self.codex.step(now, left)
+        if self.codex.changed:
+            self.codex.changed = False
+            self.changed = True
+        if not self.complete and self.walked and not self.queue and self.codex.complete:
             self.complete = True
             self.changed = True
             self._compact()
@@ -585,10 +610,11 @@ class UsageHistory:
             for record in self.detail.values():
                 if self.start <= record[0] < self.today:
                     _add_counts(days, record[0], record[1], record[2:])
-            for day, models in self.opencode.days.items():
-                if self.start <= day < self.today:
-                    for model, counts in models.items():
-                        _add_counts(days, day, model, counts)
+            for source in (self.opencode.days, self.codex.days):
+                for day, models in source.items():
+                    if self.start <= day < self.today:
+                        for model, counts in models.items():
+                            _add_counts(days, day, model, counts)
             self.days = {}
             for day in sorted(days):
                 models = {model: dict(zip(("input", "output", "cacheRead", "cacheWrite"), counts))
@@ -598,7 +624,8 @@ class UsageHistory:
         if self.complete:
             progress = 1.0
         else:
-            progress = min(1.0, self.read_bytes / self.total_bytes) if self.total_bytes else 0.0
+            total = self.total_bytes + self.codex.total_bytes
+            progress = min(1.0, (self.read_bytes + self.codex.read_bytes) / total) if total else 0.0
         return {"complete": self.complete, "progress": round(progress, 3),
                 "days": json.loads(json.dumps(self.days))}  # a copy, so callers can't change the cache
 
@@ -678,6 +705,181 @@ class OpencodeUsage:
                 connection.close()
         except sqlite3.Error:
             return None
+
+
+class CodexUsage:
+    """Tokens per local day and model from codex's session logs.
+
+    Codex writes one `token_count` event per reply, with no message id, so each
+    file is counted on its own and a repeated event is told apart by its running
+    total. Each file keeps its own counts as well, so one that is rewritten is
+    taken out and read again instead of counted twice. Files are read by offset
+    within the budget UsageHistory gives each pass, as these logs grow large.
+    Today is kept with the past days, so at midnight it simply becomes one.
+    """
+
+    def __init__(self, root=None):
+        if root is None:
+            root = os.path.join(os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), "sessions")
+        self.root = root
+        self.files = {}  # path -> {"offset", "pending", "inode", "mtime", "model", "last", "days"}
+        self.queue = []  # paths with unread bytes, oldest file first
+        self.days = {}  # day -> model -> [input, output, cacheRead, cacheWrite], every file added up
+        self.walked = False
+        self.last_walk = 0.0
+        self.complete = False
+        self.total_bytes = 0  # what the first scan has to read
+        self.read_bytes = 0
+        self.changed = False  # a day before today changed; UsageHistory clears it
+        self.today = ""
+        self.start = ""
+        self.start_time = 0.0
+
+    def set_day(self, today, start, start_time):
+        """Move the window, dropping files and days that left it."""
+        self.today, self.start, self.start_time = today, start, start_time
+        for path in [path for path, state in self.files.items() if state["mtime"] < start_time]:
+            del self.files[path]  # all it holds is from before the window
+        self.queue = [path for path in self.queue if path in self.files]
+        for days in [self.days] + [state["days"] for state in self.files.values()]:
+            for day in [day for day in days if day < start]:
+                del days[day]
+
+    def step(self, now, limit):
+        """Read at most limit bytes, all there is if None. The bytes read."""
+        if not self.queue:
+            if not self.walked or now - self.last_walk >= WALK_INTERVAL:
+                self._walk(now)
+            else:
+                # Between walks, only files written lately can have grown, and a
+                # stat of those is cheap enough to keep today's tokens current.
+                for path, state in list(self.files.items()):
+                    if state["mtime"] >= now - 86400 and self._check(path) > 0:
+                        self.queue.append(path)
+        used = 0
+        while self.queue and (limit is None or used < limit):
+            path = self.queue[0]
+            count, finished = self._read(path, self.files[path], None if limit is None else limit - used)
+            used += count
+            if finished:
+                self.queue.pop(0)
+        if self.walked and not self.queue:
+            self.complete = True
+        return used
+
+    def _walk(self, now):
+        self.last_walk = now
+        found = []
+        for folder, _, names in os.walk(self.root):
+            for name in names:
+                if name.endswith(".jsonl"):
+                    path = os.path.join(folder, name)
+                    unread = self._check(path)
+                    if unread > 0:
+                        found.append((self.files[path]["mtime"], path, unread))
+        found.sort()
+        queued = set(self.queue)
+        self.queue.extend(path for _, path, _ in found if path not in queued)
+        if not self.walked:
+            self.walked = True
+            self.total_bytes = sum(unread for _, _, unread in found)
+
+    def _check(self, path):
+        """Unread bytes in a file inside the window. Starts it over if it was rewritten."""
+        try:
+            info = os.stat(path)
+        except OSError:
+            return 0
+        if info.st_mtime < self.start_time:
+            return 0  # nothing in it can be in the window, so it is not opened
+        state = self.files.get(path)
+        if state is None or info.st_size < state["offset"] or info.st_ino != state["inode"]:
+            if state is not None:
+                self._take_out(state)
+            state = self.files[path] = {"offset": 0, "pending": b"", "inode": info.st_ino, "mtime": 0.0,
+                                        "model": "unknown", "last": None, "days": {}}
+        state["mtime"] = info.st_mtime
+        return info.st_size - state["offset"]
+
+    def _take_out(self, state):
+        for day, models in state["days"].items():
+            for model, counts in models.items():
+                bucket = self.days[day][model]
+                for index in range(4):
+                    bucket[index] -= counts[index]
+                if not any(bucket):
+                    del self.days[day][model]
+            if not self.days[day]:
+                del self.days[day]
+            if day < self.today:
+                self.changed = True
+
+    def _read(self, path, state, limit):
+        """(bytes read, whether the file is done)."""
+        used = 0
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(state["offset"])
+                while limit is None or used < limit:
+                    chunk = handle.read(READ_CHUNK if limit is None else min(READ_CHUNK, limit - used))
+                    if not chunk:
+                        return used, True
+                    used += len(chunk)
+                    state["offset"] += len(chunk)
+                    if not self.complete:
+                        self.read_bytes += len(chunk)
+                    # A line split between two reads, or still being written, waits in pending.
+                    lines = (state["pending"] + chunk).split(b"\n")
+                    state["pending"] = lines.pop()
+                    for line in lines:
+                        self._line(line, state)
+        except OSError:
+            return used, True
+        return used, False
+
+    def _line(self, line, state):
+        # Most lines are conversation, large and private: they are never parsed.
+        if b'"token_count"' not in line and b'"turn_context"' not in line:
+            return
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(entry, dict) or not isinstance(entry.get("payload"), dict):
+            return
+        payload = entry["payload"]
+        if entry.get("type") == "turn_context":
+            model = payload.get("model")
+            if isinstance(model, str) and model:
+                state["model"] = sys.intern(model)
+            return
+        if entry.get("type") != "event_msg" or payload.get("type") != "token_count":
+            return
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            return  # sent before the first reply, or for rate limits only
+        total = info.get("total_token_usage")
+        if isinstance(total, dict):
+            if total == state["last"]:
+                return  # the same event again
+            state["last"] = total
+        usage = info.get("last_token_usage")
+        when = parse_timestamp(entry.get("timestamp"))
+        if not isinstance(usage, dict) or when is None:
+            return
+        day = local_day(when)
+        if day < self.start:
+            return
+        # input_tokens includes the cached ones, and output_tokens the reasoning.
+        cached = _count(usage, "cached_input_tokens")
+        counts = [max(0, _count(usage, "input_tokens") - cached), _count(usage, "output_tokens"),
+                  cached, _count(usage, "cache_write_input_tokens")]
+        if not any(counts):
+            return
+        _add_counts(self.days, day, state["model"], counts)
+        _add_counts(state["days"], day, state["model"], counts)
+        if day < self.today:
+            self.changed = True
 
 
 def _add_counts(days, day, model, counts):
@@ -1289,6 +1491,20 @@ def opencode_installed():
     return False
 
 
+def codex_installed():
+    """Whether a `codex` command exists. It is never run."""
+    for folder in os.environ.get("PATH", "").split(os.pathsep) + list(CODEX_DIRS):
+        path = os.path.join(folder, "codex")
+        if os.path.isabs(folder) and os.path.isfile(path) and os.access(path, os.X_OK):
+            return True
+    return False
+
+
+def remote_runner_installed():
+    """Whether mm-remote-run is there to take tasks sent with -H. It is never run."""
+    return os.path.isfile(REMOTE_RUNNER) and os.access(REMOTE_RUNNER, os.X_OK)
+
+
 VERSION_LINE = re.compile(r"^MM_WORKER_VERSION\s*=\s*([0-9]+)\s*(?:#.*)?$", re.MULTILINE)
 
 
@@ -1343,7 +1559,8 @@ def _dispatcher_files():
             "reason": reason[:200],
         }
     return {"installed": installed, "version": version, "claudeInstalled": claude,
-            "rules": rules, "rulesValid": valid, "providers": providers}
+            "remoteRunner": remote_runner_installed(), "rules": rules, "rulesValid": valid,
+            "providers": providers}
 
 
 class Dispatcher:
@@ -1861,6 +2078,111 @@ class ClaudeAccount:
         return self.account
 
 
+def newest_log(root, limit=None):
+    """Epoch seconds of the newest *.jsonl below root, or None.
+
+    Visits at most TOOLS_WALK_LIMIT entries, so a huge log folder costs a bounded
+    look and the newest found by then is the answer. Folders changed last are
+    entered first: a new session file changes its folder, so that is where the
+    newest log usually is."""
+    limit = TOOLS_WALK_LIMIT if limit is None else limit
+    newest, folders, seen = None, [root], 0
+    while folders and seen < limit:
+        try:
+            entries = os.scandir(folders.pop())
+        except OSError:
+            continue
+        found = []
+        with entries:
+            for entry in entries:
+                if seen >= limit:
+                    break
+                seen += 1
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        found.append((entry.stat(follow_symlinks=False).st_mtime, entry.path))
+                    elif entry.name.endswith(".jsonl"):
+                        mtime = entry.stat().st_mtime
+                        newest = mtime if newest is None else max(newest, mtime)
+                except OSError:
+                    pass
+        found.sort()  # the newest last, so it is taken next
+        folders.extend(path for _, path in found)
+    return newest
+
+
+def _file_newest(paths):
+    """The latest mtime among these files, or None if none exists."""
+    times = []
+    for path in paths:
+        try:
+            times.append(os.stat(path).st_mtime)
+        except OSError:
+            pass
+    return max(times) if times else None
+
+
+def _non_empty(path):
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def read_tools(account, keys, system=None):
+    """Which coding tools this machine has, when each last wrote usage data and
+    whether it looks signed in. Nothing is run, and a credential file is only
+    tested for existence or size, never opened.
+
+    signedIn is true, false, or None for "can't tell". A login that has expired
+    still reads true, as only the tool itself can tell. account is what
+    ClaudeAccount found; keys is whether each provider has a key, as the
+    dispatcher reports it."""
+    system = sys.platform if system is None else system
+    claude_dir = os.path.join(HOME, ".claude")
+    claude_used = newest_log(PROJECTS)
+    if (_non_empty(os.path.join(claude_dir, "oauth-token"))
+            or os.path.isfile(os.path.join(claude_dir, ".credentials.json")) or account):
+        claude_signed_in = True
+    else:
+        claude_signed_in = None if system == "darwin" else False  # a Mac may keep it in the Keychain
+    opencode_used = _file_newest((OPENCODE_DB, OPENCODE_DB + "-wal"))
+    if os.path.isfile(os.path.join(os.path.dirname(OPENCODE_DB), "auth.json")) or any(keys.values()):
+        opencode_signed_in = True
+    else:
+        opencode_signed_in = None  # it can also take keys from the environment or its config
+    codex_used = None
+    for folder in CODEX_HOMES:
+        used = newest_log(os.path.join(folder, "sessions"))
+        if used is not None:
+            codex_used = used if codex_used is None else max(codex_used, used)
+    codex_signed_in = any(os.path.isfile(os.path.join(folder, "auth.json")) for folder in CODEX_HOMES)
+    return {
+        "claude": {"installed": claude_installed(), "hasData": claude_used is not None,
+                   "lastUsed": claude_used, "signedIn": claude_signed_in},
+        "opencode": {"installed": opencode_installed(), "hasData": opencode_used is not None,
+                     "lastUsed": opencode_used, "signedIn": opencode_signed_in},
+        "codex": {"installed": codex_installed(), "hasData": codex_used is not None,
+                  "lastUsed": codex_used, "signedIn": codex_signed_in},
+    }
+
+
+class Tools:
+    """read_tools at most every TOOLS_INTERVAL, as these machines are doing other work."""
+
+    def __init__(self):
+        self.checked_at = None
+        self.tools = None
+
+    def read(self, now, account, dispatcher):
+        if self.checked_at is None or now - self.checked_at >= TOOLS_INTERVAL:
+            self.checked_at = now
+            keys = {name: state["configured"] for name, state in dispatcher["providers"].items()
+                    if name in API_KEYS}
+            self.tools = read_tools(account, keys)
+        return json.loads(json.dumps(self.tools))  # a copy, so callers can't change the cache
+
+
 def os_user():
     try:
         return pwd.getpwuid(os.getuid()).pw_name
@@ -1883,13 +2205,14 @@ def host_info():
     }
 
 
-def snapshot(log, now, vitals=None, dispatcher=None, history=None, account=None):
+def snapshot(log, now, vitals=None, dispatcher=None, history=None, account=None, tools=None):
     """One snapshot. usageHistory is in it only when it is news (see UsageHistory.news)."""
     sessions, models = log.report(now, history)
     if history is not None:
-        for model, counts in history.read_opencode(now).items():
-            bucket = models.setdefault(model, _empty_usage())
-            _add(bucket, dict(zip(("input", "output", "cacheRead", "cacheWrite"), counts)))
+        for today in (history.read_opencode(now), history.read_codex(now)):
+            for model, counts in today.items():
+                bucket = models.setdefault(model, _empty_usage())
+                _add(bucket, dict(zip(("input", "output", "cacheRead", "cacheWrite"), counts)))
     workers = (local_workers(now, log.streams, log.usage_by_session)
                + remote_jobs(now, log.streams, log.usage_by_session))
     live = {worker.pop("stream") for worker in workers if "stream" in worker}
@@ -1897,14 +2220,17 @@ def snapshot(log, now, vitals=None, dispatcher=None, history=None, account=None)
     host = host_info()
     if vitals is not None:
         host.update(vitals.read(now))
+    claude_account = (account if account is not None else ClaudeAccount()).read(now)
+    machine_dispatcher = (dispatcher if dispatcher is not None else Dispatcher()).read(now)
     report = {
         "agentVersion": AGENT_VERSION,
         "host": host,
-        "claudeAccount": (account if account is not None else ClaudeAccount()).read(now),
+        "claudeAccount": claude_account,
         "sessions": sessions,
         "todayByModel": models,
         "workers": workers,
-        "dispatcher": (dispatcher if dispatcher is not None else Dispatcher()).read(now),
+        "dispatcher": machine_dispatcher,
+        "tools": (tools if tools is not None else Tools()).read(now, claude_account, machine_dispatcher),
     }
     news = history.news(now) if history is not None else None
     if news is not None:
@@ -1932,6 +2258,7 @@ def main(argv):
     vitals = Vitals()
     dispatcher = Dispatcher()
     account = ClaudeAccount()
+    tools = Tools()
     time.sleep(0.25)  # so the first CPU reading has an interval to measure
     once = "--once" in argv
     last_body = None
@@ -1941,7 +2268,7 @@ def main(argv):
         log.scan(now)
         if once:
             history.finish(now)
-        report = snapshot(log, now, vitals, dispatcher, history, account)
+        report = snapshot(log, now, vitals, dispatcher, history, account, tools)
         # Ages and machine load change on every pass, so they don't count as news.
         body = json.dumps(_without_clock(report), sort_keys=True)
         if once or "usageHistory" in report or body != last_body or now - last_sent >= HEARTBEAT:
