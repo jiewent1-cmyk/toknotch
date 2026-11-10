@@ -244,7 +244,8 @@ final class FleetTests: XCTestCase {
     "claude":{"enabled":true,"slots":4},"qwen":{"enabled":false,"slots":4},\
     "codex":{"enabled":false,"slots":4}},\
     "levels":{"simple":{"minimax":"fast","zhipu":"flash","claude":"sonnet"},\
-    "normal":{"minimax":"m3","zhipu":"flash","claude":"sonnet"},"hard":{"claude":"claude-opus-5-5"}},\
+    "normal":{"minimax":"m3","zhipu":"flash","claude":"sonnet"},"hard":{"claude":"claude-opus-5-5"},\
+    "extreme":{"claude":"claude-fable-5-2"}},\
     "defaults":{"timeoutSeconds":900,"cooldownSeconds":1800}}
     """
 
@@ -290,6 +291,8 @@ final class FleetTests: XCTestCase {
         XCTAssertEqual(issues { $0.providers["minimax"]?.slots = 33 }, [.slots(provider: "minimax")])
         XCTAssertEqual(issues { $0.providers["minimax"]?.slots = 32 }, [])
         XCTAssertEqual(issues { $0.levels["hard"] = nil }, [.missingLevel("hard")])
+        XCTAssertEqual(issues { $0.levels["extreme"] = nil }, [])
+        XCTAssertEqual(issues { $0.levels["extreme"] = [:] }, [.emptyLevel("extreme")])
         XCTAssertEqual(issues { $0.levels["hard"] = [:] }, [.emptyLevel("hard")])
         XCTAssertEqual(issues { $0.levels["extra"] = ["claude": "sonnet"] }, [.unknownLevel("extra")])
         XCTAssertEqual(issues { $0.levels["hard"]?["claude"] = "fast" }, [.model(level: "hard", provider: "claude")])
@@ -336,7 +339,7 @@ final class FleetTests: XCTestCase {
 
         rules = .defaults
         rules.setEnabled(false, for: "claude")
-        XCTAssertEqual(rules.levelsWithoutEnabledProvider(), ["hard"])
+        XCTAssertEqual(rules.levelsWithoutEnabledProvider(), ["hard", "extreme"])
     }
 
     // MARK: Unsaved edits
@@ -473,7 +476,7 @@ final class FleetTests: XCTestCase {
         for level in FleetRules.levelNames {
             XCTAssertNil(defaults.levels[level]?["codex"], level)
         }
-        XCTAssertEqual(FleetRules.bundledDispatcherVersion, 5)
+        XCTAssertEqual(FleetRules.bundledDispatcherVersion, 6)
         XCTAssertEqual(FleetRules.codexDispatcherVersion, 5)
     }
 
@@ -492,6 +495,14 @@ final class FleetTests: XCTestCase {
         XCTAssertEqual(snapshot.dispatcher?.rules, rules)
     }
 
+    func testExtremeDefaultsToFableAndNeedsDispatcher6() {
+        XCTAssertEqual(FleetRules.defaults.levels["extreme"], ["claude": "claude-fable-5-2"])
+        XCTAssertTrue(FleetRules.isAllowedModel("claude-fable-5-2", provider: "claude"))
+        XCTAssertEqual(FleetRules.extremeDispatcherVersion, 6)
+        XCTAssertEqual(FleetRules.knownLevels(dispatcherVersion: 5), ["simple", "normal", "hard"])
+        XCTAssertEqual(FleetRules.knownLevels(dispatcherVersion: 6), FleetRules.levelNames)
+    }
+
     func testSavingToAnOlderDispatcherRemovesCodexOnly() {
         var withCodex = FleetRules.defaults
         withCodex.revision = 3
@@ -506,9 +517,12 @@ final class FleetTests: XCTestCase {
         without.providers["codex"] = nil
         without.order.removeAll { $0 == "codex" }
         without.levels["hard"]?["codex"] = nil
+        without.levels["extreme"] = nil
+        var withoutExtreme = withCodex
+        withoutExtreme.levels["extreme"] = nil
         XCTAssertEqual(withCodex.forDispatcher(version: 4), without)
         XCTAssertEqual(withCodex.forDispatcher(version: 0), without)
-        XCTAssertEqual(withCodex.forDispatcher(version: 5), withCodex)
+        XCTAssertEqual(withCodex.forDispatcher(version: 5), withoutExtreme)
         XCTAssertEqual(withCodex.forDispatcher(version: 6), withCodex)
         XCTAssertEqual(FleetRules.knownProviders(dispatcherVersion: 4), ["minimax", "zhipu", "claude", "qwen"])
         XCTAssertEqual(FleetRules.knownProviders(dispatcherVersion: 5), FleetRules.providerNames)
@@ -521,7 +535,9 @@ final class FleetTests: XCTestCase {
         XCTAssertEqual(sent.order, ["minimax", "zhipu", "claude", "qwen"])
         XCTAssertEqual(sent.providers["qwen"], FleetRules.Provider(enabled: false, slots: 4))
         XCTAssertEqual(sent.balance, FleetRules.balancePriority)
-        XCTAssertEqual(sent.levels, FleetRules.defaults.levels)
+        var levelsBefore6 = FleetRules.defaults.levels
+        levelsBefore6["extreme"] = nil
+        XCTAssertEqual(sent.levels, levelsBefore6)
         XCTAssertEqual(sent.revision, 3)
         XCTAssertEqual(sent.validate(), [])
         editor.saved(sent, revision: 4, now: moment)

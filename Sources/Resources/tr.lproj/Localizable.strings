@@ -261,6 +261,7 @@
 "fleet.rules.level.simple" = "Simple";
 "fleet.rules.level.normal" = "Normal";
 "fleet.rules.level.hard" = "Hard";
+"fleet.rules.level.extreme" = "Extreme";
 "fleet.rules.dontUse" = "Don’t use";
 "fleet.rules.levelStranded" = "%@ tasks have no enabled provider, so only a task sent to a provider directly would run.";
 "fleet.rules.balance" = "Balance";

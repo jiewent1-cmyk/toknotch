@@ -118,7 +118,12 @@ enum FleetSetup {
         switch provider {
         case "minimax": return "m3"
         case "zhipu", "qwen": return "flash"
-        case "claude": return level == "hard" ? "claude-opus-5-5" : "sonnet"
+        case "claude":
+            switch level {
+            case "extreme": return "claude-fable-5-2"
+            case "hard": return "claude-opus-5-5"
+            default: return "sonnet"
+            }
         // Setup never turns codex on, so this matters only once the user has.
         case "codex": return "default"
         default: return nil

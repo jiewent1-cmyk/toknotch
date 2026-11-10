@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-MM_WORKER_VERSION = 5
+MM_WORKER_VERSION = 6
 
 # mm-worker: runs one non-interactive Claude Code task on one of several
 # providers, chosen by task level and load, and moves to the next provider when
@@ -35,14 +35,16 @@ usage: mm-worker [options] "prompt"
        echo "prompt" | mm-worker [options]
        any of these may end with -- <claude arguments...>
 
-  -l, --level simple|normal|hard   task level (default normal, or simple with -m fast)
+  -l, --level simple|normal|hard|extreme
+                                   task level (default normal, or simple with -m fast)
   -b, -P, --backend auto|minimax|zhipu|claude|qwen|codex
                                    force a provider, even a disabled one (default auto)
   -m, --mm-model m3|m27|fast|NAME  MiniMax model
   -z, --zp-model flash|NAME        Zhipu model
   -q, --qw-model glm|max|flash|lite|ds
                                    Qwen endpoint model
-  -c, --claude-model MODEL         Claude model (opus only for hard)
+  -c, --claude-model MODEL         Claude model (opus only for hard and extreme,
+                                   fable only for extreme)
       --codex-model default|NAME   Codex model (default: codex chooses); codex runs on
                                    this machine only; after --, only --allowedTools
       --cli claude|opencode        Agent to run the worker with (or MM_WORKER_CLI, or the
@@ -62,11 +64,14 @@ stdout carries only the result; logs go to stderr. Exit codes: 0 success,
 """
 
 PROVIDERS = ("minimax", "zhipu", "claude", "qwen", "codex")
-LEVELS = ("simple", "normal", "hard")
+LEVELS = ("simple", "normal", "hard", "extreme")
+# Rules written before extreme existed leave it out. Such a file stays valid,
+# and the level takes its default.
+OPTIONAL_LEVELS = ("extreme",)
 MODELS = {
     "minimax": ("m3", "m27", "fast"),
     "zhipu": ("flash",),
-    "claude": ("sonnet", "haiku", "claude-opus-5-5"),
+    "claude": ("sonnet", "haiku", "claude-opus-5-5", "claude-fable-5-2"),
     "qwen": ("glm", "max", "flash", "lite", "ds"),
     "codex": ("default",),  # pass no -m: codex chooses
 }
@@ -108,12 +113,15 @@ DEFAULT_RULES = {
         "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet"},
         "normal": {"minimax": "m3", "zhipu": "flash", "claude": "sonnet"},
         "hard": {"claude": "claude-opus-5-5"},
+        "extreme": {"claude": "claude-fable-5-2"},
     },
     "defaults": {"timeoutSeconds": 900, "cooldownSeconds": 1800},
 }
 
 # With -b, a provider the level's rules leave out still needs a model.
 LEVEL_FALLBACK = {
+    "extreme": {"minimax": "m3", "zhipu": "flash", "claude": "claude-fable-5-2", "qwen": "glm",
+                "codex": "default"},
     "hard": {"minimax": "m3", "zhipu": "flash", "claude": "claude-opus-5-5", "qwen": "glm",
              "codex": "default"},
     "normal": {"minimax": "m3", "zhipu": "flash", "claude": "sonnet", "qwen": "flash",
@@ -265,11 +273,14 @@ def validate_rules(rules):
     for name, entry in providers.items():
         if entry["enabled"] and name not in order:
             return "order must include the enabled provider %s" % name
-    error = _exact_keys(rules["levels"], LEVELS, "levels")
+    levels = rules["levels"]
+    required_levels = tuple(level for level in LEVELS
+                            if level not in OPTIONAL_LEVELS or (isinstance(levels, dict) and level in levels))
+    error = _exact_keys(levels, required_levels, "levels")
     if error:
         return error
-    for level in LEVELS:
-        models = rules["levels"][level]
+    for level in required_levels:
+        models = levels[level]
         if not isinstance(models, dict) or not models:
             return "levels.%s must name at least one provider" % level
         for name, model in models.items():
@@ -305,6 +316,8 @@ def load_rules(path):
     problem = validate_rules(rules)
     if problem:
         return json.loads(json.dumps(DEFAULT_RULES)), problem
+    for level in OPTIONAL_LEVELS:
+        rules["levels"].setdefault(level, dict(DEFAULT_RULES["levels"][level]))
     return rules, None
 
 
@@ -1791,8 +1804,12 @@ class Dispatcher(object):
         if self.level not in LEVELS:
             log("unknown level: %s" % self.level)
             raise Exit(2)
-        if self.level != "hard" and o.claude_model and "opus" in o.claude_model:
-            log("opus is only for hard tasks, using sonnet")
+        if self.level != "extreme" and o.claude_model and "fable" in o.claude_model:
+            fallback = "claude-opus-5-5" if self.level == "hard" else "sonnet"
+            log("fable is only for extreme tasks, using %s" % fallback)
+            o.claude_model = fallback
+        if self.level not in ("hard", "extreme") and o.claude_model and "opus" in o.claude_model:
+            log("opus is only for hard and extreme tasks, using sonnet")
             o.claude_model = "sonnet"
         # A task sent to another machine runs there with mm-remote-run, under claude.
         self.cli = "claude" if o.host else (o.cli or self.rules.get("cli", "claude"))

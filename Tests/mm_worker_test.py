@@ -769,7 +769,8 @@ class RulesValidation(unittest.TestCase):
             "slots true": lambda r: r["providers"]["zhipu"].update(slots=True),
             "slots as text": lambda r: r["providers"]["zhipu"].update(slots="4"),
             "missing level": lambda r: r["levels"].pop("hard"),
-            "unknown level": lambda r: r["levels"].update(extreme={"claude": "sonnet"}),
+            "unknown level": lambda r: r["levels"].update(insane={"claude": "sonnet"}),
+            "empty extreme": lambda r: r["levels"].update(extreme={}),
             "empty level": lambda r: r["levels"].update(hard={}),
             "level not an object": lambda r: r["levels"].update(hard=["claude"]),
             "level names unknown provider": lambda r: r["levels"]["simple"].update(local="x"),
@@ -785,6 +786,17 @@ class RulesValidation(unittest.TestCase):
         for name, change in cases.items():
             with self.subTest(case=name):
                 self.assertIsInstance(self.check(change), str)
+
+    def test_extreme_may_be_left_out_and_then_takes_its_default(self):
+        rules = copy.deepcopy(MW.DEFAULT_RULES)
+        del rules["levels"]["extreme"]
+        self.assertIsNone(MW.validate_rules(rules))
+        path = os.path.join(tempfile.mkdtemp(prefix="mmw-"), "old-rules.json")
+        with open(path, "w") as handle:
+            json.dump(rules, handle)
+        loaded, problem = MW.load_rules(path)
+        self.assertIsNone(problem)
+        self.assertEqual(loaded["levels"]["extreme"], {"claude": "claude-fable-5-2"})
 
     def test_a_level_may_not_name_a_provider_the_rules_leave_out(self):
         def change(r):
@@ -1357,7 +1369,7 @@ class Codex(CodexBase):
             for model in ("gpt-5.5", "codex-mini", "default"):
                 self.assertIsInstance(check(provider, model), str, (provider, model))
         self.assertEqual({level: MW.LEVEL_FALLBACK[level]["codex"] for level in MW.LEVELS},
-                         {"simple": "default", "normal": "default", "hard": "default"})
+                         {"simple": "default", "normal": "default", "hard": "default", "extreme": "default"})
 
     # --- environment
 
@@ -1495,6 +1507,8 @@ class Rules(Base):
         cases = [(["-l", "simple", "-b", "minimax"], "minimax", "haiku"),
                  (["-l", "normal", "-b", "minimax"], "minimax", "opus[1m]"),
                  (["-l", "hard"], "claude", "claude-opus-5-5"),
+                 (["-l", "extreme"], "claude", "claude-fable-5-2"),
+                 (["-l", "extreme", "-b", "minimax"], "minimax", "opus[1m]"),
                  (["-l", "normal", "-b", "zhipu"], "zhipu", "sonnet"),
                  (["-l", "normal", "-b", "claude"], "claude", "sonnet"),
                  (["-l", "simple", "-b", "qwen"], "qwen", "deepseek-v4-pro-0813[1m]"),
@@ -1514,13 +1528,23 @@ class Rules(Base):
 
     def test_opus_is_refused_outside_hard(self):
         done = self.mw("-b", "claude", "-c", "claude-opus-5-5", "x")
-        self.assertIn("opus is only for hard", done.stderr.decode())
+        self.assertIn("opus is only for hard and extreme", done.stderr.decode())
         self.assertEqual(self.records("claude")[-1]["argv"][:2], ["--model", "sonnet"])
         self.mw("-b", "claude", "x", env={"MM_WORKER_CLAUDE_MODEL": "opus"})
         self.assertEqual(self.records("claude")[-1]["argv"][:2], ["--model", "sonnet"])
         self.mw("-l", "hard", "-c", "haiku", "x")
         self.assertEqual(self.records("claude")[-1]["argv"][:2], ["--model", "haiku"])
         self.mw("-l", "hard", "x", env={"MM_WORKER_CLAUDE_MODEL": "claude-opus-5-5"})
+        self.assertEqual(self.records("claude")[-1]["argv"][:2], ["--model", "claude-opus-5-5"])
+
+    def test_fable_is_only_for_extreme(self):
+        done = self.mw("-l", "hard", "-c", "claude-fable-5-2", "x")
+        self.assertIn("fable is only for extreme tasks, using claude-opus-5-5", done.stderr.decode())
+        self.assertEqual(self.records("claude")[-1]["argv"][:2], ["--model", "claude-opus-5-5"])
+        done = self.mw("-b", "claude", "-c", "claude-fable-5-2", "x")
+        self.assertIn("fable is only for extreme tasks, using sonnet", done.stderr.decode())
+        self.assertEqual(self.records("claude")[-1]["argv"][:2], ["--model", "sonnet"])
+        self.mw("-l", "extreme", "-c", "claude-opus-5-5", "x")
         self.assertEqual(self.records("claude")[-1]["argv"][:2], ["--model", "claude-opus-5-5"])
 
     def test_a_level_with_no_enabled_provider(self):
@@ -1680,7 +1704,7 @@ class Arguments(Base):
                  (["-b", "claude", "-f", os.path.join(self.root, "nothing")], "cannot read the prompt"),
                  (["-b", "local", "x"], "the local model backend has been removed"),
                  (["-b", "ollama", "x"], "unknown backend"),
-                 (["-l", "extreme", "x"], "unknown level"),
+                 (["-l", "insane", "x"], "unknown level"),
                  (["-t", "soon", "x"], "timeout must be a number"),
                  (["-t", "0", "x"], "timeout must be above 0"),
                  (["x", "-l"], "-l needs a value")]
@@ -2045,7 +2069,7 @@ class Source(unittest.TestCase):
     def test_header(self):
         lines = self.text.splitlines()
         self.assertEqual(lines[0], "#!/usr/bin/env python3")
-        self.assertEqual(lines[1], "MM_WORKER_VERSION = 5")
+        self.assertEqual(lines[1], "MM_WORKER_VERSION = 6")
 
     def test_python_3_9_grammar(self):
         ast.parse(self.text, feature_version=(3, 9))

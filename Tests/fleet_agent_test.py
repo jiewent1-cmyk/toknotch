@@ -402,6 +402,7 @@ class CodexWorker(Base):
 
     def codex_rules(self, model="default"):
         rules = copy.deepcopy(self.agent.DEFAULT_RULES)
+        del rules["levels"]["extreme"]  # dispatcher 5 doesn't know it
         rules["providers"]["codex"]["enabled"] = True
         rules["order"].append("codex")
         rules["levels"]["hard"]["codex"] = model
@@ -423,6 +424,7 @@ class CodexWorker(Base):
             self.assertFalse(os.path.exists(rules_path))
         without = copy.deepcopy(self.agent.DEFAULT_RULES)
         del without["providers"]["codex"]
+        del without["levels"]["extreme"]
         self.assertEqual(self.rules_set(without), {"ok": True, "revision": 1})
         # A reset leaves codex out for a dispatcher that would refuse the file.
         self.assertEqual(self.agent.rules_reset("1"), {"ok": True, "revision": 2})
@@ -431,7 +433,9 @@ class CodexWorker(Base):
         self.assertEqual(self.rules_set(self.codex_rules(), "2"), {"ok": True, "revision": 3})
         self.assertEqual(self.agent.load_rules()[0]["levels"]["hard"]["codex"], "default")
         self.assertEqual(self.agent.rules_reset("3"), {"ok": True, "revision": 4})
-        self.assertEqual(self.agent.load_rules(), (dict(self.agent.DEFAULT_RULES, revision=4), True))
+        defaults = copy.deepcopy(self.agent.DEFAULT_RULES)
+        del defaults["levels"]["extreme"]
+        self.assertEqual(self.agent.load_rules(), (dict(defaults, revision=4), True))
 
     def test_codex_models_are_default_or_a_gpt_or_codex_full_name(self):
         self.write_dispatcher(5)
@@ -1423,7 +1427,7 @@ class DispatcherReport(DispatcherBase):
 class Rules(DispatcherBase):
     def setUp(self):
         super().setUp()
-        self.write_dispatcher(5)  # the defaults name codex
+        self.write_dispatcher(6)  # the defaults name codex and extreme
 
     def rules(self, **changes):
         rules = copy.deepcopy(self.agent.DEFAULT_RULES)
@@ -1683,7 +1687,7 @@ class KeyPrivacy(DispatcherBase):
             self.assertNotIn(FAKE_KEY, handle.read())
 
     def test_rules_take_a_full_name_for_its_own_provider_only(self):
-        self.write_dispatcher(5)
+        self.write_dispatcher(6)
         rules = self.rules_with_model("MiniMax-M2.5")
         self.assertIs(self.cli("rules-set", encode(rules), "0")[0]["ok"], True)
         for bad in ("glm-5.1", "m3 ; rm -rf x", "MiniMax-" + "x" * 90):
@@ -1703,6 +1707,7 @@ class KeyPrivacy(DispatcherBase):
     def test_the_cli_rule_waits_for_a_dispatcher_and_for_opencode(self):
         rules = copy.deepcopy(self.agent.DEFAULT_RULES)
         del rules["providers"]["codex"]  # dispatchers 2 and 3 don't know it
+        del rules["levels"]["extreme"]
         rules["cli"] = "opencode"
         self.write_dispatcher(2)
         self.assertIn("too old", self.cli("rules-set", encode(rules), "0")[0]["error"])
@@ -1723,6 +1728,7 @@ class KeyPrivacy(DispatcherBase):
         rules["levels"]["simple"]["minimax"] = model
         if not codex:
             del rules["providers"]["codex"]  # as the app saves to a dispatcher older than 5
+            del rules["levels"]["extreme"]
         return rules
 
 

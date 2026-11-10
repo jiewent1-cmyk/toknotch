@@ -261,6 +261,7 @@
 "fleet.rules.level.simple" = "简单";
 "fleet.rules.level.normal" = "普通";
 "fleet.rules.level.hard" = "困难";
+"fleet.rules.level.extreme" = "极困难";
 "fleet.rules.dontUse" = "不使用";
 "fleet.rules.levelStranded" = "“%@”级别没有已启用的提供商，只有直接指定提供商的任务才会运行。";
 "fleet.rules.balance" = "均衡方式";

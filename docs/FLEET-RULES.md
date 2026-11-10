@@ -34,7 +34,8 @@ up across machines exceed what an account allows.
   "levels": {
     "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet"},
     "normal": {"minimax": "m3", "zhipu": "flash", "claude": "sonnet"},
-    "hard": {"claude": "claude-opus-5-5"}
+    "hard": {"claude": "claude-opus-5-5"},
+    "extreme": {"claude": "claude-fable-5-2"}
   },
   "defaults": {"timeoutSeconds": 900, "cooldownSeconds": 1800}
 }
@@ -57,8 +58,11 @@ test keeps them equal.
   still reaches it, as a deliberate override.
 - `providers.<p>.slots`: an integer from 1 to 32.
 - `levels.<level>`: the providers that may take this level and the model each
-  uses. A provider that isn't listed doesn't take the level. All three levels
-  must exist and each must name at least one provider.
+  uses. A provider that isn't listed doesn't take the level. `simple`, `normal`
+  and `hard` must exist; `extreme` may be left out, and then takes its default
+  (a file from before the level existed stays valid). Each level present must
+  name at least one provider. `extreme` needs `MM_WORKER_VERSION` 6: `rules-set`
+  refuses it for an older dispatcher, and `rules-reset` leaves it out there.
 - `defaults.timeoutSeconds`: 30 to 86400. `defaults.cooldownSeconds`: 0 to 86400.
 
 Allowed models, by provider:
@@ -67,7 +71,7 @@ Allowed models, by provider:
 |---|---|---|
 | `minimax` | `m3`, `m27`, `fast` | MiniMax-M3, M2.7, M2.7-highspeed |
 | `zhipu` | `flash` | GLM-5.3-Flash |
-| `claude` | `sonnet`, `haiku`, `claude-opus-5-5` | |
+| `claude` | `sonnet`, `haiku`, `claude-opus-5-5`, `claude-fable-5-2` | Opus 5.5, Fable 5.2 |
 | `qwen` | `glm`, `max`, `flash`, `lite`, `ds` | GLM-5.3, qwen3.8-max, qwen3.8-flash, qwen3.6-flash, DeepSeek-V4-Pro-0813 |
 | `codex` | `default` | No `-m`: codex chooses its own model |
 

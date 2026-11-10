@@ -106,11 +106,13 @@ API_KEYS = {"minimax": "MINIMAX_API_KEY", "zhipu": "ZHIPU_API_KEY", "qwen": "QWE
 MODELS = {
     "minimax": ("m3", "m27", "fast"),
     "zhipu": ("flash",),
-    "claude": ("sonnet", "haiku", "claude-opus-5-5"),
+    "claude": ("sonnet", "haiku", "claude-opus-5-5", "claude-fable-5-2"),
     "qwen": ("glm", "max", "flash", "lite", "ds"),
     "codex": ("default",),  # pass no model and let codex choose
 }
-LEVELS = ("simple", "normal", "hard")
+LEVELS = ("simple", "normal", "hard", "extreme")
+# A file written before extreme existed leaves it out and stays valid.
+OPTIONAL_LEVELS = ("extreme",)
 
 # Besides the short names above, a rule may name a model as the provider's own
 # API does. The prefix keeps one provider's model off another, and keeps a key
@@ -139,6 +141,9 @@ CLIS = ("claude", "opencode")
 # The first mm-worker that knows the provider codex. An older one would call
 # rules naming it invalid, the same way.
 CODEX_DISPATCHER = 5
+# The first mm-worker that knows the level extreme, and Fable 5.2 by its short
+# name. An older one would call rules with that level invalid.
+EXTREME_DISPATCHER = 6
 OPENCODE_DIRS = (os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".opencode", "bin"),
                  "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
 CODEX_DIRS = (os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".npm-global", "bin"),
@@ -175,6 +180,7 @@ DEFAULT_RULES = {
         "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet"},
         "normal": {"minimax": "m3", "zhipu": "flash", "claude": "sonnet"},
         "hard": {"claude": "claude-opus-5-5"},
+        "extreme": {"claude": "claude-fable-5-2"},
     },
     "defaults": {"timeoutSeconds": 900, "cooldownSeconds": 1800},
 }
@@ -1404,10 +1410,11 @@ def rules_error(rules):
     levels = rules["levels"]
     if not isinstance(levels, dict):
         return "levels must be an object"
-    error = _key_error(levels, "levels", LEVELS)
+    present = tuple(level for level in LEVELS if level not in OPTIONAL_LEVELS or level in levels)
+    error = _key_error(levels, "levels", present)
     if error:
         return error
-    for level in LEVELS:
+    for level in present:
         field = "levels." + level
         choice = levels[level]
         if not isinstance(choice, dict) or not choice:
@@ -1437,6 +1444,15 @@ def default_rules(revision=0):
     return rules
 
 
+def with_optional_levels(rules):
+    """A file written before extreme existed, as a dispatcher that knows the
+    level reads it: with the default."""
+    if dispatcher_version()[1] >= EXTREME_DISPATCHER:
+        for level in OPTIONAL_LEVELS:
+            rules["levels"].setdefault(level, dict(DEFAULT_RULES["levels"][level]))
+    return rules
+
+
 def load_rules():
     """(rules, valid). A missing file means the defaults. So does an unusable
     one, flagged invalid so the app can offer to repair it."""
@@ -1453,7 +1469,7 @@ def load_rules():
         rules = None
     if rules is None or rules_error(rules):
         return default_rules(), False
-    return rules, True
+    return with_optional_levels(rules), True
 
 
 def _shell_word(text):
@@ -1734,6 +1750,8 @@ def rules_set(encoded, expected):
         return {"ok": False, "error": "this machine's mm-worker is too old for codex: update it first"}
     if "cli" in rules and dispatcher_version()[1] < CLI_DISPATCHER:
         return {"ok": False, "error": "this machine's mm-worker is too old to choose a CLI: update it first"}
+    if any(level in rules["levels"] for level in OPTIONAL_LEVELS) and dispatcher_version()[1] < EXTREME_DISPATCHER:
+        return {"ok": False, "error": "this machine's mm-worker is too old for the extreme level: update it first"}
     if rules.get("cli") == "opencode" and not opencode_installed():
         return {"ok": False, "error": "opencode isn't installed on this machine"}
     return write_rules(rules, int(expected))
@@ -1750,6 +1768,9 @@ def rules_reset(expected):
     rules = default_rules(int(expected) + 1)
     if dispatcher_version()[1] < CODEX_DISPATCHER:
         del rules["providers"]["codex"]  # an older mm-worker would call the defaults invalid
+    if dispatcher_version()[1] < EXTREME_DISPATCHER:
+        for level in OPTIONAL_LEVELS:
+            del rules["levels"][level]  # likewise
     return write_rules(rules, int(expected))
 
 

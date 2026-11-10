@@ -261,6 +261,7 @@
 "fleet.rules.level.simple" = "簡單";
 "fleet.rules.level.normal" = "普通";
 "fleet.rules.level.hard" = "困難";
+"fleet.rules.level.extreme" = "極困難";
 "fleet.rules.dontUse" = "不使用";
 "fleet.rules.levelStranded" = "「%@」級別沒有已啟用的供應商，只有直接指定供應商的任務才會執行。";
 "fleet.rules.balance" = "平衡方式";

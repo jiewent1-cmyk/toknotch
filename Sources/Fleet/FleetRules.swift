@@ -34,18 +34,24 @@ struct FleetRules: Codable, Equatable {
     static let cliDispatcherVersion = 3
 
     /// The `MM_WORKER_VERSION` of the `mm-worker.py` in this app's bundle.
-    static let bundledDispatcherVersion = 5
+    static let bundledDispatcherVersion = 6
     /// The first `mm-worker` that accepts full model names. An older one would
     /// call such rules invalid and silently go back to its defaults.
     static let fullNamesDispatcherVersion = 2
     /// The first `mm-worker` that knows `codex`. An older one reads any rule
     /// naming it as invalid, so the view hides it there and saving removes it.
     static let codexDispatcherVersion = 5
+    /// The first `mm-worker` that knows the level `extreme`. An older one reads
+    /// rules naming it as invalid, so the view hides it there and saving removes it.
+    static let extremeDispatcherVersion = 6
 
     static let balanceProportional = "proportional"
     static let balancePriority = "priority"
     static let balances = [balanceProportional, balancePriority]
-    static let levelNames = ["simple", "normal", "hard"]
+    static let levelNames = ["simple", "normal", "hard", "extreme"]
+    /// Levels a file may leave out: rules written before the level existed.
+    /// `mm-worker` then gives it the default.
+    static let optionalLevels: Set<String> = ["extreme"]
     static let providerNames = ["minimax", "zhipu", "claude", "qwen", "codex"]
     static let slotRange = 1...32
     static let timeoutRange = 30...86400
@@ -71,6 +77,7 @@ struct FleetRules: Codable, Equatable {
             Model(id: "sonnet", displayName: "Sonnet"),
             Model(id: "haiku", displayName: "Haiku"),
             Model(id: "claude-opus-5-5", displayName: "Opus 5.5"),
+            Model(id: "claude-fable-5-2", displayName: "Fable 5.2"),
         ],
         "qwen": [
             Model(id: "glm", displayName: "GLM-5.3"),
@@ -101,6 +108,7 @@ struct FleetRules: Codable, Equatable {
             "simple": ["minimax": "fast", "zhipu": "flash", "claude": "sonnet"],
             "normal": ["minimax": "m3", "zhipu": "flash", "claude": "sonnet"],
             "hard": ["claude": "claude-opus-5-5"],
+            "extreme": ["claude": "claude-fable-5-2"],
         ],
         defaults: Defaults(timeoutSeconds: 900, cooldownSeconds: 1800)
     )
@@ -169,7 +177,7 @@ extension FleetRules {
         }
         for level in Self.levelNames {
             guard let models = levels[level] else {
-                issues.append(.missingLevel(level))
+                if !Self.optionalLevels.contains(level) { issues.append(.missingLevel(level)) }
                 continue
             }
             if models.isEmpty { issues.append(.emptyLevel(level)) }
@@ -212,12 +220,21 @@ extension FleetRules {
         providerNames.filter { $0 != "codex" || dispatcherVersion >= codexDispatcherVersion }
     }
 
-    /// These rules without the providers a dispatcher of this version doesn't
-    /// know. Otherwise `rules-set` would refuse them, even when the only mention
-    /// is the disabled entry the defaults carry.
+    /// The levels a dispatcher of this version can read a rule about.
+    static func knownLevels(dispatcherVersion: Int) -> [String] {
+        levelNames.filter { $0 != "extreme" || dispatcherVersion >= extremeDispatcherVersion }
+    }
+
+    /// These rules without the providers and levels a dispatcher of this version
+    /// doesn't know. Otherwise `rules-set` would refuse them, even when the only
+    /// mention is the disabled entry the defaults carry.
     func forDispatcher(version: Int) -> FleetRules {
         let known = Self.knownProviders(dispatcherVersion: version)
         var rules = self
+        let knownLevels = Self.knownLevels(dispatcherVersion: version)
+        for level in Self.levelNames where !knownLevels.contains(level) {
+            rules.levels[level] = nil
+        }
         for provider in Self.providerNames where !known.contains(provider) {
             rules.providers[provider] = nil
             rules.order.removeAll { $0 == provider }

@@ -144,7 +144,7 @@ final class FleetSetupTests: XCTestCase {
     // MARK: Rules 3 to 5
 
     /// Opencode without claude: the CLI moves, claude and the keyless go, and
-    /// `hard`, which named only claude, gets the first provider left.
+    /// `hard` and `extreme`, which named only claude, get the first provider left.
     func testAnOpencodeMachineMovesToOpencode() throws {
         let snapshot = machine(tools: tools(claude: false, opencode: true), configured: ["zhipu"])
         let result = try proposal(snapshot)
@@ -153,10 +153,12 @@ final class FleetSetupTests: XCTestCase {
             .disableProvider("minimax"),
             .disableProvider("claude"),
             .addToLevel(level: "hard", provider: "zhipu", model: "flash"),
+            .addToLevel(level: "extreme", provider: "zhipu", model: "flash"),
         ])
         let rules = try XCTUnwrap(result.rules)
         XCTAssertEqual(rules.cli, "opencode")
         XCTAssertEqual(rules.levels["hard"], ["claude": "claude-opus-5-5", "zhipu": "flash"])
+        XCTAssertEqual(rules.levels["extreme"], ["claude": "claude-fable-5-2", "zhipu": "flash"])
         XCTAssertEqual(rules.validate(), [])
         XCTAssertEqual(result.needs, [])
         try assertIdempotent(snapshot)
@@ -171,6 +173,7 @@ final class FleetSetupTests: XCTestCase {
         XCTAssertEqual(result.changes, [
             .disableProvider("claude"),
             .addToLevel(level: "hard", provider: "minimax", model: "m3"),
+            .addToLevel(level: "extreme", provider: "minimax", model: "m3"),
         ])
         XCTAssertEqual(result.rules?.cli, "opencode")
         XCTAssertFalse(result.changes.contains(.setCLI("claude")))
@@ -231,6 +234,7 @@ final class FleetSetupTests: XCTestCase {
         one.providers["zhipu"]?.enabled = false
         one.providers["claude"]?.enabled = false
         one.levels["hard"] = ["minimax": "m3"]
+        one.levels["extreme"] = ["minimax": "m3"]
         let alone = try proposal(machine(tools: tools(), rules: one, configured: ["claude"]))
         XCTAssertEqual(alone.changes, [])
         XCTAssertNil(alone.rules)
@@ -256,6 +260,7 @@ final class FleetSetupTests: XCTestCase {
         XCTAssertEqual(FleetSetup.defaultModel(provider: "qwen", level: "simple"), "flash")
         XCTAssertEqual(FleetSetup.defaultModel(provider: "claude", level: "simple"), "sonnet")
         XCTAssertEqual(FleetSetup.defaultModel(provider: "claude", level: "hard"), "claude-opus-5-5")
+        XCTAssertEqual(FleetSetup.defaultModel(provider: "claude", level: "extreme"), "claude-fable-5-2")
         XCTAssertEqual(FleetSetup.defaultModel(provider: "codex", level: "hard"), "default")
         for provider in FleetRules.providerNames {
             for level in FleetRules.levelNames {
@@ -316,7 +321,8 @@ final class FleetSetupTests: XCTestCase {
         let snapshot = machine(tools: tools(codex: true), rules: rules,
                                configured: ["minimax", "zhipu", "claude", "codex"])
         let result = try proposal(snapshot)
-        XCTAssertEqual(result.changes, [.addToLevel(level: "hard", provider: "codex", model: "default")])
+        XCTAssertEqual(result.changes, [.addToLevel(level: "hard", provider: "codex", model: "default"),
+                                        .addToLevel(level: "extreme", provider: "codex", model: "default")])
         XCTAssertEqual(result.rules?.levels["hard"], ["claude": "claude-opus-5-5", "codex": "default"])
         try assertIdempotent(snapshot)
     }

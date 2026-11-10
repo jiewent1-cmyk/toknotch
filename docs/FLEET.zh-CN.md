@@ -320,13 +320,13 @@ mm-worker --kill 20260612-101502-4311
 
 | 选项 | 含义 |
 |---|---|
-| `-l, --level simple\|normal\|hard` | 任务级别（默认 `normal`，配 `-m fast` 时为 `simple`） |
+| `-l, --level simple\|normal\|hard\|extreme` | 任务级别（默认 `normal`，配 `-m fast` 时为 `simple`）。`extreme`（极困难）默认用 Claude Fable 5.2 |
 | `-b, -P, --backend auto\|minimax\|zhipu\|claude\|qwen` | 强制某个提供商，已停用的也可以（默认 `auto`） |
 | `-m, --mm-model m3\|m27\|fast\|完整模型名` | MiniMax 模型 |
 | `-z, --zp-model flash\|完整模型名` | 智谱模型 |
 | `--cli claude\|opencode` | 运行 worker 的 agent，仅限本机 |
 | `-q, --qw-model glm\|max\|flash\|lite\|ds` | 千问端点模型 |
-| `-c, --claude-model MODEL` | Claude 模型（opus 只用于 hard） |
+| `-c, --claude-model MODEL` | Claude 模型（opus 只用于 hard 和 extreme，fable 只用于 extreme） |
 | `-t, --timeout SEC` | 单次运行超时（默认取自规则） |
 | `-n, --name NAME` | 在 Fleet 里显示的任务名 |
 | `-f FILE` | 从文件读提示词 |

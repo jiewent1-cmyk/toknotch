@@ -184,6 +184,11 @@ struct FleetRulesSection: View {
         FleetRules.knownProviders(dispatcherVersion: dispatcher?.version ?? 0)
     }
 
+    /// Likewise a level it doesn't know.
+    private var shownLevels: [String] {
+        FleetRules.knownLevels(dispatcherVersion: dispatcher?.version ?? 0)
+    }
+
     private var installTitleKey: String {
         status == .notInstalled ? "fleet.rules.install.titleNew" : "fleet.rules.install.titleUpdate"
     }
@@ -359,7 +364,7 @@ struct FleetRulesSection: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                ForEach(FleetRules.levelNames, id: \.self) { level in
+                ForEach(shownLevels, id: \.self) { level in
                     GridRow {
                         Text(FleetRulesText.level(level, language))
                         ForEach(shownProviders, id: \.self) { provider in

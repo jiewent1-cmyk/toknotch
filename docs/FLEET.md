@@ -371,13 +371,13 @@ accepted there, and it is translated.
 
 | Option | Meaning |
 |---|---|
-| `-l, --level simple\|normal\|hard` | Task level (default `normal`, or `simple` with `-m fast`) |
+| `-l, --level simple\|normal\|hard\|extreme` | Task level (default `normal`, or `simple` with `-m fast`). `extreme` defaults to Claude Fable 5.2 |
 | `-b, -P, --backend auto\|minimax\|zhipu\|claude\|qwen\|codex` | Force a provider, even a disabled one (default `auto`) |
 | `-m, --mm-model m3\|m27\|fast\|full name` | MiniMax model |
 | `-z, --zp-model flash\|full name` | Zhipu model |
 | `--cli claude\|opencode` | Agent that runs the worker, on this machine |
 | `-q, --qw-model glm\|max\|flash\|lite\|ds` | Qwen endpoint model |
-| `-c, --claude-model MODEL` | Claude model (opus only for hard) |
+| `-c, --claude-model MODEL` | Claude model (opus only for hard and extreme, fable only for extreme) |
 | `--codex-model default\|full name` | Codex model; `default` passes no `-m`, so codex chooses |
 | `-t, --timeout SEC` | Timeout for one run (default from the rules) |
 | `-n, --name NAME` | Task name shown in Fleet |
