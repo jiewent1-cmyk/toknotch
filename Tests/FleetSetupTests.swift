@@ -256,12 +256,69 @@ final class FleetSetupTests: XCTestCase {
         XCTAssertEqual(FleetSetup.defaultModel(provider: "qwen", level: "simple"), "flash")
         XCTAssertEqual(FleetSetup.defaultModel(provider: "claude", level: "simple"), "sonnet")
         XCTAssertEqual(FleetSetup.defaultModel(provider: "claude", level: "hard"), "claude-opus-5-5")
+        XCTAssertEqual(FleetSetup.defaultModel(provider: "codex", level: "hard"), "default")
         for provider in FleetRules.providerNames {
             for level in FleetRules.levelNames {
                 let model = FleetSetup.defaultModel(provider: provider, level: level) ?? ""
                 XCTAssertTrue(FleetRules.isAllowedModel(model, provider: provider), "\(provider) \(level)")
             }
         }
+    }
+
+    // MARK: Codex
+
+    /// Codex signed in, and every level stranded: still nothing turns it on.
+    func testSetupNeverEnablesCodex() throws {
+        let everything: Set<String> = ["minimax", "zhipu", "claude", "qwen", "codex"]
+        let plain = try proposal(machine(tools: tools(codex: true), configured: everything))
+        XCTAssertTrue(plain.isEmpty)
+
+        var rules = FleetRules.defaults
+        rules.providers["minimax"]?.enabled = false
+        rules.providers["zhipu"]?.enabled = false
+        rules.providers["claude"]?.enabled = false
+        let stranded = try proposal(machine(tools: tools(codex: true), rules: rules, configured: everything))
+        XCTAssertEqual(stranded.changes, [])
+        XCTAssertNil(stranded.rules)
+        XCTAssertEqual(stranded.needs, [.addKey])
+
+        // A file from before codex, as on real machines today.
+        var before = FleetRules.defaults
+        before.providers["codex"] = nil
+        let old = machine(tools: tools(codex: true), rules: before, configured: everything)
+        let untouched = try proposal(old)
+        XCTAssertTrue(untouched.isEmpty)
+        try assertIdempotent(old)
+    }
+
+    /// Off already, codex is left alone; turned on without a sign-in, it goes off once.
+    func testCodexIsDisabledOnlyOnce() throws {
+        let alreadyOff = try proposal(machine(tools: tools()))
+        XCTAssertTrue(alreadyOff.isEmpty)
+
+        var rules = FleetRules.defaults
+        rules.setEnabled(true, for: "codex")
+        let snapshot = machine(tools: tools(), rules: rules)
+        let result = try proposal(snapshot)
+        XCTAssertEqual(result.changes, [.disableProvider("codex")])
+        var expected = rules
+        expected.providers["codex"]?.enabled = false
+        XCTAssertEqual(result.rules, expected)
+        try assertIdempotent(snapshot)
+    }
+
+    /// Only once the user has turned codex on can it fill a level, with `default`.
+    func testACodexTheUserEnabledCanFillALevel() throws {
+        var rules = FleetRules.defaults
+        rules.providers["claude"]?.enabled = false
+        rules.providers["codex"]?.enabled = true
+        rules.order = ["codex", "minimax", "zhipu", "claude"]
+        let snapshot = machine(tools: tools(codex: true), rules: rules,
+                               configured: ["minimax", "zhipu", "claude", "codex"])
+        let result = try proposal(snapshot)
+        XCTAssertEqual(result.changes, [.addToLevel(level: "hard", provider: "codex", model: "default")])
+        XCTAssertEqual(result.rules?.levels["hard"], ["claude": "claude-opus-5-5", "codex": "default"])
+        try assertIdempotent(snapshot)
     }
 
     /// Slots, balance, order, defaults, models and revision are never touched.

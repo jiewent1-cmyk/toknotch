@@ -220,6 +220,7 @@
 "fleet.provider.zhipu" = "Zhipu";
 "fleet.provider.claude" = "Claude";
 "fleet.provider.qwen" = "Qwen";
+"fleet.provider.codex" = "Codex";
 "fleet.rules.title" = "Dispatch rules";
 "fleet.rules.notReported" = "This machine isn’t reporting its dispatch rules.";
 "fleet.rules.cancel" = "Cancel";
@@ -250,6 +251,7 @@
 "fleet.rules.key.configured" = "Configured";
 "fleet.rules.key.missing" = "No key on this machine";
 "fleet.rules.key.noClaude" = "Claude Code isn’t installed on this machine";
+"fleet.rules.key.noCodex" = "Codex isn’t installed or signed in on this machine";
 "fleet.rules.key.unknown" = "Not reported";
 "fleet.rules.keysNote" = "Keys are set on the machine itself, in ~/.config/<provider>/env. TokNotch never reads, copies or shows them.";
 "fleet.rules.cooling" = "Cooling down";
@@ -298,6 +300,7 @@
 "fleet.rules.models.providerFailed" = "%1$@’s list couldn’t be read (%2$@), so its menu shows the built-in models.";
 "fleet.rules.models.refresh" = "Refresh models";
 "fleet.rules.models.needsUpdate" = "Update this machine’s mm-worker to choose from every model its providers offer.";
+"fleet.rules.codex.needsUpdate" = "Update this machine’s mm-worker to use Codex.";
 "fleet.rules.issue.timeout" = "The default timeout must be from %1$d to %2$d seconds.";
 "fleet.rules.issue.cooldown" = "The cooldown must be from %1$d to %2$d seconds.";
 "fleet.setup.title" = "Setup";

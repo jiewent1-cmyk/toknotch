@@ -220,6 +220,7 @@
 "fleet.provider.zhipu" = "智譜";
 "fleet.provider.claude" = "Claude";
 "fleet.provider.qwen" = "千問";
+"fleet.provider.codex" = "Codex";
 "fleet.rules.title" = "派工規則";
 "fleet.rules.notReported" = "這台機器沒有回報派工規則。";
 "fleet.rules.cancel" = "取消";
@@ -250,6 +251,7 @@
 "fleet.rules.key.configured" = "已設定";
 "fleet.rules.key.missing" = "這台機器上沒有金鑰";
 "fleet.rules.key.noClaude" = "這台機器上未安裝 Claude Code";
+"fleet.rules.key.noCodex" = "這台機器上未安裝 Codex 或未登入";
 "fleet.rules.key.unknown" = "未回報";
 "fleet.rules.keysNote" = "金鑰在機器本身的 ~/.config/<供應商>/env 中設定。TokNotch 從不讀取、複製或顯示金鑰。";
 "fleet.rules.cooling" = "冷卻中";
@@ -298,6 +300,7 @@
 "fleet.rules.models.providerFailed" = "無法讀取 %1$@ 的模型清單（%2$@），它的選單只顯示內建模型。";
 "fleet.rules.models.refresh" = "重新整理模型";
 "fleet.rules.models.needsUpdate" = "更新這台機器的 mm-worker 後，才能從供應商的全部模型中選擇。";
+"fleet.rules.codex.needsUpdate" = "更新這台機器的 mm-worker 後，才能使用 Codex。";
 "fleet.rules.issue.timeout" = "預設逾時必須在 %1$d 到 %2$d 秒之間。";
 "fleet.rules.issue.cooldown" = "冷卻時間必須在 %1$d 到 %2$d 秒之間。";
 "fleet.setup.title" = "配置";

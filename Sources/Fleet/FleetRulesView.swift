@@ -87,7 +87,12 @@ enum FleetRulesText {
                                _ language: AppLanguage) -> String {
         guard let status else { return language.t("fleet.rules.key.unknown") }
         if status.configured { return language.t("fleet.rules.key.configured") }
-        return language.t(name == "claude" ? "fleet.rules.key.noClaude" : "fleet.rules.key.missing")
+        switch name {
+        case "claude": return language.t("fleet.rules.key.noClaude")
+        // Codex signs in on its own rather than with a key in an env file.
+        case "codex": return language.t("fleet.rules.key.noCodex")
+        default: return language.t("fleet.rules.key.missing")
+        }
     }
 }
 
@@ -172,6 +177,12 @@ struct FleetRulesSection: View {
     }
 
     private var status: FleetDispatcherStatus? { dispatcher?.status }
+
+    /// A provider this machine's dispatcher doesn't know isn't shown: any rule
+    /// about it would be refused, and saving removes it anyway.
+    private var shownProviders: [String] {
+        FleetRules.knownProviders(dispatcherVersion: dispatcher?.version ?? 0)
+    }
 
     private var installTitleKey: String {
         status == .notInstalled ? "fleet.rules.install.titleNew" : "fleet.rules.install.titleUpdate"
@@ -270,11 +281,17 @@ struct FleetRulesSection: View {
     private func providers(_ dispatcher: FleetDispatcher, _ rules: FleetRules) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             heading("fleet.rules.providers")
-            ForEach(FleetRules.providerNames, id: \.self) { name in
+            ForEach(shownProviders, id: \.self) { name in
                 providerRow(name, status: dispatcher.providers[name], rules: rules)
             }
-            if FleetRules.providerNames.contains(where: { dispatcher.providers[$0]?.configured != true }) {
+            if shownProviders.contains(where: { dispatcher.providers[$0]?.configured != true }) {
                 Text(language.t("fleet.rules.keysNote"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if shownProviders.count < FleetRules.providerNames.count {
+                Text(language.t("fleet.rules.codex.needsUpdate"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -336,7 +353,7 @@ struct FleetRulesSection: View {
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
                 GridRow {
                     Color.clear.frame(width: 1, height: 1)
-                    ForEach(FleetRules.providerNames, id: \.self) { provider in
+                    ForEach(shownProviders, id: \.self) { provider in
                         Text(FleetRulesText.provider(provider, language))
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -345,7 +362,7 @@ struct FleetRulesSection: View {
                 ForEach(FleetRules.levelNames, id: \.self) { level in
                     GridRow {
                         Text(FleetRulesText.level(level, language))
-                        ForEach(FleetRules.providerNames, id: \.self) { provider in
+                        ForEach(shownProviders, id: \.self) { provider in
                             modelMenu(level: level, provider: provider, rules: rules)
                         }
                     }
@@ -375,7 +392,7 @@ struct FleetRulesSection: View {
                 }
             }
             // A provider that is switched off has no need of a list.
-            ForEach(FleetRules.providerNames.filter {
+            ForEach(shownProviders.filter {
                 rules.providers[$0]?.enabled == true && store.modelListings[state.id]?.errors[$0] != nil
             }, id: \.self) { provider in
                 note(language.t("fleet.rules.models.providerFailed", FleetRulesText.provider(provider, language),
@@ -417,7 +434,9 @@ struct FleetRulesSection: View {
     // MARK: Balance, order, timings
 
     private func options(_ rules: FleetRules) -> some View {
-        HStack(alignment: .top, spacing: 24) {
+        let hidden = FleetRules.providerNames.filter { !shownProviders.contains($0) }
+        let order = rules.displayOrder.filter { !hidden.contains($0) }
+        return HStack(alignment: .top, spacing: 24) {
             VStack(alignment: .leading, spacing: 6) {
                 heading("fleet.rules.cli")
                 Picker(selection: Binding(
@@ -470,8 +489,8 @@ struct FleetRulesSection: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 heading("fleet.rules.order")
-                ForEach(Array(rules.displayOrder.enumerated()), id: \.element) { index, name in
-                    orderRow(name, index: index, count: rules.displayOrder.count)
+                ForEach(Array(order.enumerated()), id: \.element) { index, name in
+                    orderRow(name, index: index, count: order.count)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

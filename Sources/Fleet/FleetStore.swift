@@ -287,7 +287,8 @@ final class FleetStore: ObservableObject {
     func saveRules(on state: FleetDeviceState) {
         guard canEditRules(on: state), let script, case .live(let alias) = state.link,
               rulesEditors[state.id]?.canSave == true,
-              let submitted = rulesEditors[state.id]?.beginSave()
+              let submitted = rulesEditors[state.id]?.beginSave(
+                dispatcherVersion: state.snapshot?.dispatcher?.version ?? 0)
         else { return }
         let id = state.id, device = state.device
         rulesNotices[id] = nil

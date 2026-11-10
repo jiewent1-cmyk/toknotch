@@ -34,16 +34,19 @@ struct FleetRules: Codable, Equatable {
     static let cliDispatcherVersion = 3
 
     /// The `MM_WORKER_VERSION` of the `mm-worker.py` in this app's bundle.
-    static let bundledDispatcherVersion = 4
+    static let bundledDispatcherVersion = 5
     /// The first `mm-worker` that accepts full model names. An older one would
     /// call such rules invalid and silently go back to its defaults.
     static let fullNamesDispatcherVersion = 2
+    /// The first `mm-worker` that knows `codex`. An older one reads any rule
+    /// naming it as invalid, so the view hides it there and saving removes it.
+    static let codexDispatcherVersion = 5
 
     static let balanceProportional = "proportional"
     static let balancePriority = "priority"
     static let balances = [balanceProportional, balancePriority]
     static let levelNames = ["simple", "normal", "hard"]
-    static let providerNames = ["minimax", "zhipu", "claude", "qwen"]
+    static let providerNames = ["minimax", "zhipu", "claude", "qwen", "codex"]
     static let slotRange = 1...32
     static let timeoutRange = 30...86400
     static let cooldownRange = 0...86400
@@ -76,6 +79,10 @@ struct FleetRules: Codable, Equatable {
             Model(id: "lite", displayName: "qwen3.6-flash"),
             Model(id: "ds", displayName: "DeepSeek-V4-Pro-0813"),
         ],
+        // Passes no model, so codex makes its own choice.
+        "codex": [
+            Model(id: "default", displayName: "Default"),
+        ],
     ]
 
     static let defaults = FleetRules(
@@ -88,6 +95,7 @@ struct FleetRules: Codable, Equatable {
             "zhipu": Provider(enabled: true, slots: 4),
             "claude": Provider(enabled: true, slots: 4),
             "qwen": Provider(enabled: false, slots: 4),
+            "codex": Provider(enabled: false, slots: 4),
         ],
         levels: [
             "simple": ["minimax": "fast", "zhipu": "flash", "claude": "sonnet"],
@@ -199,6 +207,27 @@ extension FleetRules {
         return rules
     }
 
+    /// The providers a dispatcher of this version can read a rule about.
+    static func knownProviders(dispatcherVersion: Int) -> [String] {
+        providerNames.filter { $0 != "codex" || dispatcherVersion >= codexDispatcherVersion }
+    }
+
+    /// These rules without the providers a dispatcher of this version doesn't
+    /// know. Otherwise `rules-set` would refuse them, even when the only mention
+    /// is the disabled entry the defaults carry.
+    func forDispatcher(version: Int) -> FleetRules {
+        let known = Self.knownProviders(dispatcherVersion: version)
+        var rules = self
+        for provider in Self.providerNames where !known.contains(provider) {
+            rules.providers[provider] = nil
+            rules.order.removeAll { $0 == provider }
+            for level in Array(rules.levels.keys) {
+                rules.levels[level]?[provider] = nil
+            }
+        }
+        return rules
+    }
+
     /// Levels that are valid but can't get automatic work, because every provider
     /// they name is switched off. Worth a warning rather than an error.
     func levelsWithoutEnabledProvider() -> [String] {
@@ -243,6 +272,7 @@ extension FleetRules {
         "zhipu": ["glm-"],
         "claude": ["claude-"],
         "qwen": ["qwen", "glm-", "deepseek-"],
+        "codex": ["gpt-", "codex-"],
     ]
 
     /// What a provider lists but this account can't use: the GLM Coding Plan
@@ -452,10 +482,11 @@ struct FleetRulesEditor: Equatable {
         draft = baseline
     }
 
-    /// Marks a save as under way and gives what to send.
-    mutating func beginSave() -> FleetRules {
+    /// Marks a save as under way and gives what to send. The draft also loses
+    /// what the machine's dispatcher can't read, so a save leaves it clean.
+    mutating func beginSave(dispatcherVersion: Int = FleetRules.bundledDispatcherVersion) -> FleetRules {
         isSaving = true
-        draft = draft.normalized
+        draft = draft.normalized.forDispatcher(version: dispatcherVersion)
         var submitted = draft
         submitted.revision = expectedRevision
         return submitted

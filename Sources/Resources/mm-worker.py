@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-MM_WORKER_VERSION = 4
+MM_WORKER_VERSION = 5
 
 # mm-worker: runs one non-interactive Claude Code task on one of several
 # providers, chosen by task level and load, and moves to the next provider when
@@ -36,13 +36,15 @@ usage: mm-worker [options] "prompt"
        any of these may end with -- <claude arguments...>
 
   -l, --level simple|normal|hard   task level (default normal, or simple with -m fast)
-  -b, -P, --backend auto|minimax|zhipu|claude|qwen
+  -b, -P, --backend auto|minimax|zhipu|claude|qwen|codex
                                    force a provider, even a disabled one (default auto)
   -m, --mm-model m3|m27|fast|NAME  MiniMax model
   -z, --zp-model flash|NAME        Zhipu model
   -q, --qw-model glm|max|flash|lite|ds
                                    Qwen endpoint model
   -c, --claude-model MODEL         Claude model (opus only for hard)
+      --codex-model default|NAME   Codex model (default: codex chooses); codex runs on
+                                   this machine only; after --, only --allowedTools
       --cli claude|opencode        Agent to run the worker with (or MM_WORKER_CLI, or the
                                    rule "cli"; default claude). opencode: minimax, zhipu,
                                    qwen on this machine; after --, only --allowedTools
@@ -59,13 +61,14 @@ stdout carries only the result; logs go to stderr. Exit codes: 0 success,
 124 timeout, 130 cancelled or interrupted, anything else failure.
 """
 
-PROVIDERS = ("minimax", "zhipu", "claude", "qwen")
+PROVIDERS = ("minimax", "zhipu", "claude", "qwen", "codex")
 LEVELS = ("simple", "normal", "hard")
 MODELS = {
     "minimax": ("m3", "m27", "fast"),
     "zhipu": ("flash",),
     "claude": ("sonnet", "haiku", "claude-opus-5-5"),
     "qwen": ("glm", "max", "flash", "lite", "ds"),
+    "codex": ("default",),  # pass no -m: codex chooses
 }
 
 # The command-line agents that can run a worker.
@@ -79,6 +82,7 @@ MODEL_PREFIXES = {
     "zhipu": ("glm-",),
     "claude": ("claude-",),
     "qwen": ("qwen", "glm-", "deepseek-"),
+    "codex": ("gpt-", "codex-"),
 }
 FULL_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}")
 
@@ -98,6 +102,7 @@ DEFAULT_RULES = {
         "zhipu": {"enabled": True, "slots": 4},
         "claude": {"enabled": True, "slots": 4},
         "qwen": {"enabled": False, "slots": 4},
+        "codex": {"enabled": False, "slots": 4},
     },
     "levels": {
         "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet"},
@@ -109,9 +114,12 @@ DEFAULT_RULES = {
 
 # With -b, a provider the level's rules leave out still needs a model.
 LEVEL_FALLBACK = {
-    "hard": {"minimax": "m3", "zhipu": "flash", "claude": "claude-opus-5-5", "qwen": "glm"},
-    "normal": {"minimax": "m3", "zhipu": "flash", "claude": "sonnet", "qwen": "flash"},
-    "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet", "qwen": "ds"},
+    "hard": {"minimax": "m3", "zhipu": "flash", "claude": "claude-opus-5-5", "qwen": "glm",
+             "codex": "default"},
+    "normal": {"minimax": "m3", "zhipu": "flash", "claude": "sonnet", "qwen": "flash",
+               "codex": "default"},
+    "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet", "qwen": "ds",
+               "codex": "default"},
 }
 
 # Each provider maps Claude's model aliases to its own models (see provider_env),
@@ -122,6 +130,7 @@ ALIASES = {
     "qwen": {"glm": "glm-5.3[1m]", "max": "opus", "flash": "sonnet", "lite": "haiku",
              "ds": "deepseek-v4-pro-0813[1m]"},
     "claude": {},
+    "codex": {},
 }
 
 KEY_VARS = {
@@ -142,6 +151,8 @@ SCRUBBED = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "
 CLAUDE_FALLBACKS = ("~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
 OPENCODE_FALLBACKS = ("~/.local/bin/opencode", "~/.opencode/bin/opencode", "/opt/homebrew/bin/opencode",
                       "/usr/local/bin/opencode")
+CODEX_FALLBACKS = ("~/.npm-global/bin/codex", "~/.local/bin/codex", "/opt/homebrew/bin/codex",
+                   "/usr/local/bin/codex")
 
 # Quota errors as the providers word them, including their Chinese texts for
 # balance, quota, limit and expiry, and their numeric quota codes.
@@ -397,6 +408,8 @@ def provider_env(provider, base):
 def has_key(provider):
     if provider == "claude":
         return True
+    if provider == "codex":
+        return find_codex() is not None and codex_signed_in()
     values = dict(os.environ)
     values.update(read_env_file(env_file(provider)))
     return bool(values.get(KEY_VARS[provider][1], "").strip())
@@ -422,6 +435,26 @@ def find_opencode():
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     return None
+
+
+def find_codex():
+    found = shutil.which("codex")
+    if found:
+        return found
+    for path in CODEX_FALLBACKS:
+        path = os.path.expanduser(path)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def codex_signed_in():
+    """Whether codex has something to sign in with. Only whether the file exists:
+    it holds a credential, so it is never opened."""
+    homes = [os.environ.get("CODEX_HOME"), os.path.join(os.path.expanduser("~"), ".codex")]
+    if any(home and os.path.isfile(os.path.join(home, "auth.json")) for home in homes):
+        return True
+    return bool(os.environ.get("OPENAI_API_KEY", "").strip())
 
 
 # ---------- opencode ----------
@@ -453,12 +486,10 @@ BASH_ESCAPES = ("*>*", "*<*", "*$(*", "*`*", "*;*", "*&*", "*|*", "*\n*")
 TOOL_SPEC = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\([^)]*\))?")
 
 
-def opencode_permission(extra):
-    """The permissions for claude-style arguments after `--`, as tight as claude -p:
-    reading is open, and everything else is denied unless --allowedTools names it.
-    With no permissions at all, opencode would let a worker write anything, so every
-    run sets them, each by name so that no opencode.json can open one up. An argument
-    with no equivalent is an error, as dropping it could widen what the worker may do."""
+def allowed_tools(extra, agent):
+    """The tool names --allowedTools gives in claude-style arguments after `--`. An
+    argument with no equivalent for the agent is an error, as dropping it could widen
+    what the worker may do."""
     specs, i = [], 0
     while i < len(extra):
         arg = extra[i]
@@ -470,7 +501,16 @@ def opencode_permission(extra):
                 specs.append(extra[i])
                 i += 1
         else:
-            raise UsageError("opencode has no equivalent of %s" % arg)
+            raise UsageError("%s has no equivalent of %s" % (agent, arg))
+    return [tool for spec in specs for tool in TOOL_SPEC.findall(spec)]
+
+
+def opencode_permission(extra):
+    """The permissions for claude-style arguments after `--`, as tight as claude -p:
+    reading is open, and everything else is denied unless --allowedTools names it.
+    With no permissions at all, opencode would let a worker write anything, so every
+    run sets them, each by name so that no opencode.json can open one up."""
+    tools = allowed_tools(extra, "opencode")
     permission = {"*": "deny", "edit": "deny", "bash": "deny", "task": "deny", "webfetch": "deny",
                   "websearch": "deny", "todowrite": "deny", "skill": "deny", "lsp": "deny",
                   "question": "deny", "doom_loop": "deny",
@@ -479,24 +519,23 @@ def opencode_permission(extra):
                   # Each tool's own permission still decides; prompts use absolute paths.
                   "external_directory": "allow"}
     commands = None
-    for spec in specs:
-        for tool in TOOL_SPEC.findall(spec):
-            if tool == "Bash":
-                commands = "all"
-            elif tool.startswith("Bash("):
-                if commands != "all":
-                    commands = commands or {"*": "deny"}
-                    inner = tool[5:-1].strip()
-                    if inner.endswith(":*"):
-                        commands[inner[:-2]] = "allow"
-                        commands[inner[:-2] + " *"] = "allow"
-                    else:
-                        commands[inner] = "allow"
-            elif tool in OPENCODE_TOOLS:
-                if OPENCODE_TOOLS[tool] != "read":
-                    permission[OPENCODE_TOOLS[tool]] = "allow"
-            else:
-                log("opencode worker: %s has no equivalent and stays denied" % tool)
+    for tool in tools:
+        if tool == "Bash":
+            commands = "all"
+        elif tool.startswith("Bash("):
+            if commands != "all":
+                commands = commands or {"*": "deny"}
+                inner = tool[5:-1].strip()
+                if inner.endswith(":*"):
+                    commands[inner[:-2]] = "allow"
+                    commands[inner[:-2] + " *"] = "allow"
+                else:
+                    commands[inner] = "allow"
+        elif tool in OPENCODE_TOOLS:
+            if OPENCODE_TOOLS[tool] != "read":
+                permission[OPENCODE_TOOLS[tool]] = "allow"
+        else:
+            log("opencode worker: %s has no equivalent and stays denied" % tool)
     if commands == "all":
         permission["bash"] = "allow"
     elif commands:
@@ -580,6 +619,124 @@ def finish_opencode_stream(path):
                   "api_error_status": status if isinstance(status, int) else "opencode"}
     elif reason in ("stop", "end_turn", "length") and text:
         result = {"type": "result", "is_error": False, "result": "".join(text), "usage": usage}
+    else:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+
+# ---------- codex ----------
+
+CODEX_READ_TOOLS = ("Read", "Glob", "Grep", "LS")
+CODEX_WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit", "Bash")
+
+
+def codex_sandbox(extra):
+    """(sandbox, notes to log) for claude-style arguments after `--`: the tightest
+    sandbox that fits what --allowedTools names. Codex can't allow single commands,
+    so Bash(cmd:*) runs anything the sandbox lets through, which read-only still holds."""
+    sandbox, notes, commands = "read-only", [], False
+    for tool in allowed_tools(extra, "codex"):
+        if tool in CODEX_WRITE_TOOLS:
+            sandbox = "workspace-write"
+        elif tool.startswith("Bash("):
+            commands = True
+        elif tool not in CODEX_READ_TOOLS:
+            notes.append("codex worker: %s has no equivalent and stays denied" % tool)
+    if commands:
+        notes.append("codex worker: codex can't allow single commands, so Bash(...) lets it run "
+                     "any command inside the %s sandbox" % sandbox)
+    return sandbox, notes
+
+
+def codex_args(executable, sandbox, model):
+    # --ignore-user-config: the user's config.toml can add MCP servers and hooks,
+    # which would widen what a worker may do. Sign-in works without it.
+    args = [executable, "exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "-s", sandbox]
+    if model != "default":
+        args += ["-m", model]
+    return args + ["-"]
+
+
+def codex_env(base):
+    """The environment minus what points claude at a provider. MM_WORKER_ACTIVE
+    stays, so the worker can't dispatch."""
+    return {name: value for name, value in base.items()
+            if name not in SCRUBBED and not name.startswith("ANTHROPIC_")}
+
+
+def _nested_error(message):
+    """The API's whole error, which a codex error message often holds as JSON."""
+    try:
+        nested = json.loads(message)
+    except ValueError:
+        return None
+    return nested if isinstance(nested, dict) else None
+
+
+def _codex_failure(message):
+    """(readable text, status) of a codex error message."""
+    nested = _nested_error(message)
+    if nested is None:
+        return message[:500], "codex"
+    inner = nested.get("error") if isinstance(nested.get("error"), dict) else {}
+    text = inner.get("message") if isinstance(inner.get("message"), str) else message
+    status = nested.get("status")
+    # Any other status: the task didn't run, so another provider may.
+    return text[:500], status if _is_int(status) else "codex"
+
+
+def finish_codex_stream(path):
+    """Add the result line claude ends its stream with, as finish_opencode_stream
+    does. A stream that just stops gets none, which reads as a failure."""
+    answer, turn, failure = None, None, None
+    usage = {"input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+             "output_tokens": 0}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                kind = event.get("type")
+                item = event.get("item") if isinstance(event.get("item"), dict) else {}
+                # An item of type error is only a warning, such as an ignored setting.
+                if (kind == "item.completed" and item.get("type") == "agent_message"
+                        and isinstance(item.get("text"), str)):
+                    answer = item["text"]  # earlier messages are narration
+                elif kind == "turn.completed":
+                    # A turn that completes after an error has recovered from it.
+                    turn, failure = kind, None
+                    counts = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+                    tokens = {key: counts[key] if _is_int(counts.get(key)) else 0
+                              for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                                          "output_tokens")}
+                    usage["input_tokens"] += tokens["input_tokens"] - tokens["cached_input_tokens"]
+                    usage["cache_read_input_tokens"] += tokens["cached_input_tokens"]
+                    usage["cache_creation_input_tokens"] += tokens["cache_write_input_tokens"]
+                    # This already includes the reasoning tokens.
+                    usage["output_tokens"] += tokens["output_tokens"]
+                elif kind == "turn.failed":
+                    turn = kind
+                    error = event.get("error") if isinstance(event.get("error"), dict) else {}
+                    message = str(error.get("message") or "")
+                    # The error event before it usually says the same, and may be the
+                    # one that parses.
+                    if failure is None or (message and _nested_error(message) is not None):
+                        failure = message or "turn failed"
+                elif kind == "error":
+                    failure = str(event.get("message") or "unknown error")
+    except OSError:
+        return
+    if failure is not None:
+        text, status = _codex_failure(failure)
+        result = {"type": "result", "is_error": True, "result": text, "usage": usage,
+                  "api_error_status": status}
+    elif turn == "turn.completed" and answer is not None:
+        result = {"type": "result", "is_error": False, "result": answer, "usage": usage}
     else:
         return
     with open(path, "a", encoding="utf-8") as handle:
@@ -754,6 +911,7 @@ VALUE_FLAGS = {
     "-q": "qw_model", "--qw-model": "qw_model",
     "-z": "zp_model", "--zp-model": "zp_model",
     "-c": "claude_model", "--claude-model": "claude_model",
+    "--codex-model": "codex_model",
     "--cli": "cli",
     "-b": "backend", "-P": "backend", "--backend": "backend",
     "-t": "timeout", "--timeout": "timeout",
@@ -773,6 +931,7 @@ class Options(object):
         self.qw_model = None
         self.zp_model = None
         self.claude_model = os.environ.get("MM_WORKER_CLAUDE_MODEL") or None
+        self.codex_model = None
         self.cli = os.environ.get("MM_WORKER_CLI") or None
         self.backend = "auto"
         self.timeout = None
@@ -801,7 +960,7 @@ def parse_args(argv):
             field = VALUE_FLAGS[arg]
             if field == "backend" and value == "local":
                 raise UsageError("the local model backend has been removed; use minimax, zhipu, "
-                                 "claude or qwen")
+                                 "claude, qwen or codex")
             setattr(options, field, value)
             i += 2
         elif arg == "--json":
@@ -825,6 +984,8 @@ def parse_args(argv):
         raise UsageError("unknown cli: %s" % options.cli)
     if options.cli == "opencode" and options.host:
         raise UsageError("--cli opencode runs on this machine only, not with -H")
+    if options.backend == "codex" and options.host:
+        raise UsageError("codex runs on this machine only, not with -H")
     if options.timeout is not None:
         options.timeout = _positive(options.timeout, "timeout")
     if options.host and options.host.startswith("-"):
@@ -852,6 +1013,8 @@ class Dispatcher(object):
         self.claude = None
         self.opencode = None
         self.cli = "claude"
+        self.codex_refusal = None  # why codex can't take this task's arguments
+        self.codex_skip_logged = False
         self.permission = None
         self.slot = None
         self.lock_held = False
@@ -1077,6 +1240,8 @@ class Dispatcher(object):
         if self.cooling(provider):
             log("%s is cooling down (%s), skipping" % (provider, self.cooling_reason(provider)))
             return False
+        if provider == "codex":
+            return True  # no key of ours to try: codex signs in on its own
         host_var, key_var = KEY_VARS[provider]
         values = dict(os.environ)
         values.update(read_env_file(env_file(provider)))
@@ -1115,6 +1280,11 @@ class Dispatcher(object):
         # fail, and leave a cooldown that reads like a fault.
         names = [name for name in order
                  if self.rules["providers"][name]["enabled"] and name in allowed and has_key(name)]
+        if "codex" in names and self.codex_refusal:
+            if not self.codex_skip_logged:
+                log("%s, so codex is skipped" % self.codex_refusal)
+                self.codex_skip_logged = True
+            names.remove("codex")
         if self.rules["balance"] == "priority":
             return names
         return sorted(names, key=lambda name: (Fraction(self.used(name), self.limit(name)),
@@ -1122,7 +1292,8 @@ class Dispatcher(object):
 
     def model_for(self, provider):
         explicit = {"minimax": self.o.mm_model, "zhipu": self.o.zp_model,
-                    "qwen": self.o.qw_model, "claude": self.o.claude_model}[provider]
+                    "qwen": self.o.qw_model, "claude": self.o.claude_model,
+                    "codex": self.o.codex_model}[provider]
         if explicit:
             return explicit
         return (self.rules["levels"][self.level].get(provider)
@@ -1167,7 +1338,24 @@ class Dispatcher(object):
     # --- running locally
 
     def run_local(self, provider, alias, out):
-        if self.cli == "opencode":
+        # Whatever the rule cli says: codex is a provider with its own command.
+        streamed = provider == "codex" or self.cli == "opencode"
+        if provider == "codex":
+            model = self.model_for(provider)
+            sandbox, notes = codex_sandbox(self.o.extra)  # prepare checked the arguments
+            for note in notes:
+                log(note)
+            executable = find_codex()
+            if not executable:
+                log("codex not found on PATH or in %s" % ", ".join(CODEX_FALLBACKS))
+                return 127
+            args = codex_args(executable, sandbox, model)
+            env = codex_env(self.base_env)
+            # Fleet reads the model from this line: codex's events don't carry one.
+            with open(out, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "system", "subtype": "init",
+                                         "model": "codex" if model == "default" else model}) + "\n")
+        elif self.cli == "opencode":
             model = self.model_for(provider)
             args = opencode_args(self.opencode, provider, model)
             env = opencode_env(provider, model, self.permission, self.base_env)
@@ -1179,7 +1367,7 @@ class Dispatcher(object):
             args = [self.claude, "--model", alias, "-p", "--output-format", "stream-json",
                     "--verbose"] + self.o.extra
             env = provider_env(provider, self.base_env)
-        with open(self.prompt_path, "rb") as stdin, open(out, "ab" if self.cli == "opencode" else "wb") as stdout, \
+        with open(self.prompt_path, "rb") as stdin, open(out, "ab" if streamed else "wb") as stdout, \
                 open(self.stderr_path, "ab") as stderr:
             self.critical(True)
             try:
@@ -1203,7 +1391,9 @@ class Dispatcher(object):
         # Whatever the worker left running in its group goes with it.
         end_group(proc, STRAGGLER_GRACE)
         self.child = None
-        if self.cli == "opencode":
+        if provider == "codex":
+            finish_codex_stream(out)
+        elif self.cli == "opencode":
             finish_opencode_stream(out)
         compact(out)
         if self.cancelled():
@@ -1382,9 +1572,10 @@ class Dispatcher(object):
             return earlier
         got = None
         # The same selection as on this machine, so its slots, order and levels all count.
+        # Never codex: it runs only on the machine that dispatches it.
         self.take_lock()
         try:
-            candidates = self.candidates()
+            candidates = [name for name in self.candidates() if name != "codex"]
             for provider in candidates:
                 if provider in tried:
                     continue
@@ -1605,7 +1796,20 @@ class Dispatcher(object):
             o.claude_model = "sonnet"
         # A task sent to another machine runs there with mm-remote-run, under claude.
         self.cli = "claude" if o.host else (o.cli or self.rules.get("cli", "claude"))
-        if self.cli == "opencode":
+        if not o.host:
+            try:
+                codex_sandbox(o.extra)
+            except UsageError as error:
+                self.codex_refusal = str(error)
+        # Asked for by -b, codex needs neither claude nor opencode.
+        if o.backend == "codex":
+            if self.codex_refusal:
+                log(self.codex_refusal)
+                raise Exit(2)
+            if not find_codex():
+                log("codex not found on PATH or in %s" % ", ".join(CODEX_FALLBACKS))
+                raise Exit(127)
+        elif self.cli == "opencode":
             if o.backend == "claude":
                 log("opencode runs minimax, zhipu or qwen; claude needs --cli claude")
                 raise Exit(2)
@@ -1668,7 +1872,7 @@ class Dispatcher(object):
             self.take_lock()
             try:
                 candidates = [name for name in self.candidates()
-                              if self.cli != "opencode" or name in OPENCODE_BACKENDS]
+                              if self.cli != "opencode" or name in OPENCODE_BACKENDS or name == "codex"]
                 for provider in candidates:
                     if provider in tried:
                         continue

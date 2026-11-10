@@ -28,7 +28,8 @@ up across machines exceed what an account allows.
     "minimax": {"enabled": true, "slots": 8},
     "zhipu": {"enabled": true, "slots": 4},
     "claude": {"enabled": true, "slots": 4},
-    "qwen": {"enabled": false, "slots": 4}
+    "qwen": {"enabled": false, "slots": 4},
+    "codex": {"enabled": false, "slots": 4}
   },
   "levels": {
     "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet"},
@@ -50,7 +51,7 @@ test keeps them equal.
   `priority` takes the first in `order` with a free slot. Ties in `proportional`
   also follow `order`.
 - `order`: preference order. Every enabled provider must appear, once. A disabled
-  provider may appear or not, which is why the defaults can leave out `qwen`.
+  provider may appear or not, which is why the defaults can leave out `qwen` and `codex`.
   Nothing outside `providers` may appear.
 - `providers.<p>.enabled`: a disabled provider gets no automatic work. `-b <p>`
   still reaches it, as a deliberate override.
@@ -68,6 +69,7 @@ Allowed models, by provider:
 | `zhipu` | `flash` | GLM-5.3-Flash |
 | `claude` | `sonnet`, `haiku`, `claude-opus-5-5` | |
 | `qwen` | `glm`, `max`, `flash`, `lite`, `ds` | GLM-5.3, qwen3.8-max, qwen3.8-flash, qwen3.6-flash, DeepSeek-V4-Pro-0813 |
+| `codex` | `default` | No `-m`: codex chooses its own model |
 
 The optional top-level `cli` chooses the agent that runs workers: `claude` (what
 leaving it out means) or `opencode`. It needs `MM_WORKER_VERSION` 3, and `rules-set`
@@ -90,13 +92,56 @@ With `opencode`:
 - Tokens reach the ledger, and Fleet counts them from opencode's own database. See
   `docs/FLEET-USAGE.md`.
 
+### codex
+
+`codex` is a provider run by OpenAI's Codex CLI, always with the `codex` command,
+whatever `cli` says. So a machine with `cli: opencode` runs it too, and one task can
+fail over from codex to another provider or back. It is off by default, in no level
+and not in `order`, so nothing changes until someone turns it on. `-b codex` still
+reaches it. A rule naming it needs `MM_WORKER_VERSION` 5: an older dispatcher reads
+the file as invalid, so `rules-set` refuses it there.
+
+- Codex signs in on its own, with `~/.codex/auth.json` or `OPENAI_API_KEY`. There is
+  no `~/.config/codex/env`.
+- The machine has it when the `codex` command is found (on `PATH`, or in
+  `~/.npm-global/bin`, `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`) and
+  `$CODEX_HOME/auth.json`, `~/.codex/auth.json` or a non-empty `OPENAI_API_KEY`
+  exists. Automatic dispatch skips it otherwise. With `-b codex`, no command is exit 127.
+- A run is `codex exec --json --ignore-user-config --skip-git-repo-check -s <sandbox>
+  [-m MODEL] -` in the working folder, with the prompt on stdin. `--ignore-user-config`
+  keeps the user's `config.toml`, with its MCP servers and hooks, out of a worker.
+  The approval and sandbox bypasses and `--ephemeral` are never passed.
+- After `--`, only `--allowedTools` is accepted. Anything else stops a task sent
+  with `-b codex` (exit 2), and makes automatic dispatch skip codex for that task.
+- The sandbox is the tightest that fits the tools named:
+
+  | `--allowedTools` names | sandbox |
+  |---|---|
+  | nothing, or only `Read`, `Glob`, `Grep`, `LS` | `read-only` |
+  | `Bash(cmd:*)` without a write tool | `read-only` |
+  | `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, or plain `Bash` | `workspace-write` |
+
+`workspace-write` lets a worker write in the working folder and, as codex does by default, in `/tmp` and `$TMPDIR`. A real run confirmed that a write elsewhere under the home folder is refused.
+
+- A Bash allowlist can't be enforced: codex can't allow single commands, so
+  `Bash(cmd:*)` lets it run any command the sandbox allows, and the run logs this.
+  Other tools (`WebFetch`, `WebSearch`, `mcp__*`, `Task`, ...) have no equivalent:
+  the run logs them and they stay denied. The sandbox has no network.
+- `MM_WORKER_ACTIVE` stays set, so a worker can't dispatch, and `ANTHROPIC_*` and
+  the other variables meant for claude are removed.
+- The result is codex's last agent message. A failed turn or an error moves the task
+  to the next provider, and quota words in it cool codex. There is no probe request:
+  codex is available unless it is cooling.
+- Only on this machine: `-H host -b codex` is refused, and a target never picks codex
+  for a task sent to it, even if its rules enable it.
+
 A rule may also name any model by its full name, as the provider's API lists it:
 up to 80 letters, digits, `.`, `_`, `:` or `-`, starting with `MiniMax-`
-(`minimax`), `glm-` (`zhipu`), `claude-` (`claude`), or `qwen`, `glm-` or
-`deepseek-` (`qwen`), in any case. The prefix keeps one provider's model off another
-and keeps a pasted key from passing as a model. It needs `MM_WORKER_VERSION` 2, as
-an older dispatcher reads such a file as invalid. `mm-worker` passes the name to
-`claude --model` unchanged.
+(`minimax`), `glm-` (`zhipu`), `claude-` (`claude`), `qwen`, `glm-` or
+`deepseek-` (`qwen`), or `gpt-` or `codex-` (`codex`), in any case. The prefix keeps
+one provider's model off another and keeps a pasted key from passing as a model. It
+needs `MM_WORKER_VERSION` 2, as an older dispatcher reads such a file as invalid.
+`mm-worker` passes the name to `claude --model` unchanged, or to `codex -m`.
 
 Unknown keys are invalid, so a typo can't silently do nothing. An invalid file
 makes `mm-worker` warn on stderr and use the defaults. It never stops work.

@@ -2,7 +2,8 @@
 """Tests for Sources/Resources/mm-worker.py. Run: python3 Tests/mm_worker_test.py
 
 Hermetic: each test gets a temporary HOME, a fake `claude` and a fake `ssh` on
-PATH, and probes go to a local HTTP server. Nothing reaches the network or a
+PATH (and a fake `codex` or `opencode` where a test needs one), and probes go to
+a local HTTP server. Nothing reaches the network or a
 real model. The fake ssh runs commands locally against a second temporary home.
 """
 import ast, copy, glob, http.server, importlib.util, json, os, re, shutil, signal, subprocess, sys
@@ -197,7 +198,7 @@ SERVER = None
 
 def setUpModule():
     global SERVER
-    for name in ("claude",):
+    for name in ("claude", "codex"):
         if shutil.which(name, path=SYSTEM_PATH):
             raise RuntimeError("a real %s is on %s; refusing to run" % (name, SYSTEM_PATH))
     SERVER = ProbeServer()
@@ -953,6 +954,473 @@ class Opencode(Base):
         self.assertIn("this machine only", done.stderr.decode())
 
 
+# Real output of `codex exec --json`, as the contract quotes it.
+CODEX_THREAD = r'{"type":"thread.started","thread_id":"01a1..."}'
+CODEX_TURN = r'{"type":"turn.started"}'
+CODEX_COMMAND = (r'{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":'
+                 r'"/bin/zsh -lc ' "'cat a.txt'" r'","aggregated_output":"","exit_code":null,"status":"in_progress"}}')
+CODEX_SUCCESS = [
+    CODEX_THREAD,
+    CODEX_TURN,
+    r"""{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'll run it now."}}""",
+    CODEX_COMMAND,
+    r'{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc '
+    r"""'cat a.txt'","aggregated_output":"hello\n","exit_code":0,"status":"completed"}}""",
+    r'{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"pong"}}',
+    r'{"type":"turn.completed","usage":{"input_tokens":58634,"cached_input_tokens":44160,'
+    r'"cache_write_input_tokens":0,"output_tokens":147,"reasoning_output_tokens":66}}',
+]
+CODEX_WARNING = (r'{"type":"item.completed","item":{"id":"item_0","type":"error","message":'
+                 r'"Configured service tier ... will be omitted from requests."}}')
+CODEX_FAILURE = [
+    CODEX_THREAD,
+    CODEX_WARNING,
+    CODEX_TURN,
+    r"""{"type":"error","message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\","""
+    r"""\"message\":\"The 'x' model is not supported ...\",\"code\":\"model_not_found\"}}"}""",
+    r'{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,...}"}}',
+]
+CODEX_QUOTA_ERROR = json.dumps({"type": "error", "status": 429, "error": {
+    "type": "insufficient_quota", "message": "You exceeded your current quota, please check your plan."}})
+CODEX_MODES = {
+    "ok": CODEX_SUCCESS,
+    "slow": CODEX_SUCCESS,
+    "warn": [CODEX_THREAD, CODEX_WARNING] + CODEX_SUCCESS[1:],
+    "fail": CODEX_FAILURE,
+    "quota": [CODEX_THREAD, CODEX_TURN, json.dumps({"type": "error", "message": CODEX_QUOTA_ERROR}),
+              json.dumps({"type": "turn.failed", "error": {"message": CODEX_QUOTA_ERROR}})],
+    "cut": [CODEX_THREAD, CODEX_TURN, CODEX_COMMAND],
+    "multi": CODEX_SUCCESS + [
+        CODEX_TURN,
+        r'{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"second"}}',
+        r'{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":400,'
+        r'"cache_write_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":5}}'],
+}
+
+FAKE_CODEX = r'''#!@PYTHON@
+import json, os, sys, time
+MODES = json.loads(@MODES@)
+env = os.environ
+prompt = sys.stdin.read()
+log = env.get("FAKE_LOG")
+if log:
+    keep = ("ANTHROPIC_", "API_", "CLAUDE_", "MM_WORKER", "OPENAI_", "CODEX_")
+    with open(os.path.join(log, "codex-%d.json" % os.getpid()), "w") as f:
+        json.dump({"provider": "codex", "argv": sys.argv[1:], "cwd": os.getcwd(), "prompt": prompt,
+                   "time": time.time(), "env":{k: v for k, v in env.items() if k.startswith(keep)}}, f)
+mode = env.get("MODE_codex", "ok")
+if mode == "slow":
+    time.sleep(float(env.get("FAKE_SLOW", "30")))
+for line in MODES[mode]:
+    print(line, flush=True)
+sys.exit(1 if mode in ("fail", "quota") else 0)
+'''
+
+CODEX_FORBIDDEN = ("--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
+                   "danger-full-access", "--approve-for-me", "--ephemeral")
+
+
+def codex_argv(sandbox, model=None):
+    return (["exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "-s", sandbox]
+            + (["-m", model] if model else []) + ["-"])
+
+
+def enable_codex(rules, first=True):
+    """Codex on, for every level, first or second in order and taken by priority."""
+    rules["providers"]["codex"]["enabled"] = True
+    rules["order"] = ["codex", "minimax", "zhipu", "claude"] if first else ["minimax", "codex", "zhipu", "claude"]
+    rules["balance"] = "priority"
+    for level in MW.LEVELS:
+        rules["levels"][level]["codex"] = "default"
+
+
+class CodexBase(Base):
+    def setUp(self):
+        Base.setUp(self)
+        self.install(os.path.join(self.bin, "codex"))
+        write(os.path.join(self.home, ".codex/auth.json"), "{}")
+
+    def install(self, path):
+        write(path, FAKE_CODEX.replace("@PYTHON@", PY).replace("@MODES@", repr(json.dumps(CODEX_MODES))), 0o755)
+
+    def runs(self):
+        found = []
+        for path in glob.glob(os.path.join(self.log, "codex-*.json")):
+            found.append(json.loads(read(path)))
+        return sorted(found, key=lambda run: run["time"])
+
+    def enable(self, first=True, **extra):
+        self.rules(lambda rules: (enable_codex(rules, first), rules.update(extra)))
+
+    def no_fallback_codex(self):
+        if any(os.path.exists(path) for path in MW.CODEX_FALLBACKS if path.startswith("/")):
+            self.skipTest("this machine has codex in a fallback place")
+
+
+class Codex(CodexBase):
+    # --- running it
+
+    def test_each_sandbox_row_gives_its_exact_argv(self):
+        cases = [
+            ([], "read-only"),
+            (["--allowedTools", "Read,Glob,Grep,LS"], "read-only"),
+            (["--allowedTools", "Read,Bash(git log:*)"], "read-only"),
+            (["--allowedTools", "Bash(git status)", "Bash(ls:*)"], "read-only"),
+            (["--allowedTools=Edit"], "workspace-write"),
+            (["--allowedTools", "Write"], "workspace-write"),
+            (["--allowed-tools", "MultiEdit"], "workspace-write"),
+            (["--allowedTools", "NotebookEdit,Read"], "workspace-write"),
+            (["--allowedTools", "Bash"], "workspace-write"),
+            (["--allowedTools", "Bash(git:*),Edit"], "workspace-write"),
+            (["--allowedTools", "WebFetch,WebSearch,mcp__x__y,Task"], "read-only"),
+        ]
+        for extra, sandbox in cases:
+            with self.subTest(extra=extra):
+                done = self.mw("-b", "codex", "x", "--", *extra)
+                self.assertEqual((done.returncode, done.stdout.decode()), (0, "pong\n"), done.stderr.decode())
+                run = self.runs()[-1]
+                self.assertEqual(run["argv"], codex_argv(sandbox))
+                self.assertEqual((run["cwd"], run["prompt"]), (self.work, "x\n"))
+                err = done.stderr.decode()
+                bash = any("Bash(" in arg for arg in extra)
+                self.assertEqual(err.count("can't allow single commands"), 1 if bash else 0)
+        for run in self.runs():
+            for flag in CODEX_FORBIDDEN:
+                self.assertNotIn(flag, run["argv"])
+
+    def test_tools_without_an_equivalent_are_logged_and_stay_denied(self):
+        sandbox, notes = MW.codex_sandbox(["--allowedTools", "WebFetch,Bash(git:*),Bash(ls:*),mcp__x__y"])
+        self.assertEqual(sandbox, "read-only")
+        self.assertEqual(notes, [
+            "codex worker: WebFetch has no equivalent and stays denied",
+            "codex worker: mcp__x__y has no equivalent and stays denied",
+            "codex worker: codex can't allow single commands, so Bash(...) lets it run any command "
+            "inside the read-only sandbox"])
+        self.assertEqual(MW.codex_sandbox(["--allowedTools"]), ("read-only", []))
+
+    def test_opencode_keeps_its_own_wording(self):
+        with self.assertRaisesRegex(MW.UsageError, "^opencode has no equivalent of -x$"):
+            MW.opencode_permission(["-x"])
+        with self.assertRaisesRegex(MW.UsageError, "^codex has no equivalent of -x$"):
+            MW.codex_sandbox(["--allowedTools", "Read", "-x"])
+
+    def test_an_unsupported_argument_stops_b_codex(self):
+        done = self.mw("-b", "codex", "x", "--", "--dangerously-skip-permissions")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("codex has no equivalent of --dangerously-skip-permissions", done.stderr.decode())
+        self.assertEqual(self.runs(), [])
+
+    def test_an_unsupported_argument_skips_codex_in_automatic_dispatch(self):
+        self.enable()
+        done = self.mw("x", "--", "--max-turns", "3")
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n", done.stderr.decode())
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(done.stderr.decode().count("codex has no equivalent of --max-turns, so codex is skipped"), 1)
+        self.assertEqual(self.records("minimax")[-1]["argv"][-2:], ["--max-turns", "3"])
+
+    # --- the result line
+
+    def test_the_answer_is_the_last_agent_message(self):
+        done = self.mw("-b", "codex", "x")
+        self.assertEqual((done.returncode, done.stdout.decode()), (0, "pong\n"))
+        self.assertEqual(self.ledger(), ["codex ok in=58634 out=147"])
+        stream = glob.glob(os.path.join(self.state, "runs/*.codex.json"))[0]
+        self.assertEqual(len(read(stream).splitlines()), 1)
+        self.assertEqual(self.live_slots(), [])
+        self.assert_no_leftovers()
+
+    def test_a_warning_item_is_not_a_failure(self):
+        done = self.mw("-b", "codex", "x", env={"MODE_codex": "warn"})
+        self.assertEqual((done.returncode, done.stdout.decode()), (0, "pong\n"))
+
+    def test_a_failed_turn_gives_the_nested_message_and_fails_over(self):
+        done = self.mw("-b", "codex", "x", env={"MODE_codex": "fail"})
+        self.assertEqual((done.returncode, done.stdout), (75, b""))
+        self.assertIn("The 'x' model is not supported ...", done.stderr.decode())
+        self.assertEqual(self.ledger(), ["codex api_error(400) in=0 out=0"])
+        self.assertEqual(self.cooling_files(), [], "a 400 is not a quota error")
+        self.enable()
+        done = self.mw("x", env={"MODE_codex": "fail"})
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+        self.assertTrue(self.records("minimax")[-1]["prompt"].startswith(MW.FAILOVER_NOTE))
+
+    def test_quota_words_cool_codex(self):
+        self.enable()
+        done = self.mw("x", env={"MODE_codex": "quota"})
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+        self.assertGreater(self.until("codex"), 1700)
+        self.assertIn("quota used up during the run (status 429)",
+                      read(os.path.join(self.state, "codex_unavailable_reason")))
+        done = self.mw("x")
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+        self.assertEqual(len(self.runs()), 1, "a cooling codex is skipped")
+        done = self.mw("-b", "codex", "x")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("all providers are unavailable", done.stderr.decode())
+
+    def test_a_stream_that_just_stops_is_a_failure(self):
+        done = self.mw("-b", "codex", "x", env={"MODE_codex": "cut"})
+        self.assertEqual((done.returncode, done.stdout), (75, b""))
+        self.enable()
+        done = self.mw("x", env={"MODE_codex": "cut"})
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+
+    def test_tokens_are_summed_over_turns(self):
+        done = self.mw("-b", "codex", "--json", "x", env={"MODE_codex": "multi"})
+        result = json.loads(done.stdout.decode())
+        self.assertEqual(result["result"], "second")
+        self.assertEqual(result["usage"], {"input_tokens": 14474 + 600, "cache_read_input_tokens": 44560,
+                                           "cache_creation_input_tokens": 10, "output_tokens": 167})
+        self.assertEqual(self.ledger(), ["codex ok in=59644 out=167"])
+
+    def test_finishing_the_contract_lines(self):
+        def finish(lines):
+            path = os.path.join(self.root, "stream.json")
+            write(path, "".join(line + "\n" for line in lines))
+            MW.finish_codex_stream(path)
+            last = read(path).splitlines()[-1]
+            return json.loads(last) if last not in lines else None
+        for lines in CODEX_MODES.values():
+            for line in lines:
+                self.assertIsInstance(json.loads(line), dict, line)
+        result = finish(CODEX_FAILURE)
+        self.assertEqual((result["is_error"], result["result"], result["api_error_status"]),
+                         (True, "The 'x' model is not supported ...", 400))
+        result = finish(CODEX_SUCCESS)
+        self.assertEqual((result["is_error"], result["result"]), (False, "pong"))
+        self.assertIsNone(finish(CODEX_MODES["cut"]))
+        self.assertIsNone(finish([CODEX_THREAD, CODEX_TURN, CODEX_SUCCESS[-1]]), "no agent message")
+        result = finish([CODEX_THREAD, CODEX_TURN, '{"type":"error","message":"stream disconnected"}',
+                         '{"type":"turn.failed","error":{"message":"stream disconnected"}}'])
+        self.assertEqual((result["result"], result["api_error_status"]), ("stream disconnected", "codex"))
+        long = json.dumps({"type": "turn.failed", "error": {"message": json.dumps(
+            {"status": "x", "error": {"message": "quota " * 200}})}})
+        result = finish([CODEX_THREAD, CODEX_TURN, long])
+        self.assertEqual((len(result["result"]), result["api_error_status"]), (500, "codex"))
+
+    def test_the_first_line_names_the_model_for_fleet(self):
+        for args, model in (([], "codex"), (["--codex-model", "gpt-5.5"], "gpt-5.5")):
+            with self.subTest(model=model):
+                proc = self.start("-b", "codex", *(args + ["x"]), env={"MODE_codex": "slow", "FAKE_SLOW": "1.5"})
+                stream = self.wait_for(lambda: glob.glob(os.path.join(self.state, "runs/*.codex.json")), 10,
+                                       "the stream")[0]
+                self.assertEqual(json.loads(read(stream).splitlines()[0]),
+                                 {"type": "system", "subtype": "init", "model": model})
+                rc, out, _ = self.finish(proc, 30)
+                self.assertEqual((rc, out), (0, "pong\n"))
+                os.unlink(stream)
+
+    # --- slots, timeout, cancel and failover
+
+    def test_slots_hold(self):
+        self.occupy("codex", 4)
+        proc = self.start("-b", "codex", "x", patch={"QUEUE_SLEEP": 0.2})
+        time.sleep(1.5)
+        self.assertIsNone(proc.poll())
+        self.assertIn("all slots are busy (codex)", read(proc.err_path))
+        self.assertEqual(self.runs(), [])
+        shutil.rmtree(os.path.join(self.state, "slots/codex/3"))
+        rc, out, _ = self.finish(proc, 10)
+        self.assertEqual((rc, out), (0, "pong\n"))
+        self.assertEqual(len(self.live_slots("codex")), 3)
+
+    def test_slots_come_from_the_rules(self):
+        self.rules(lambda r: r["providers"]["codex"].update(slots=1))
+        procs = [self.start("-b", "codex", "t%d" % i, env={"MODE_codex": "slow", "FAKE_SLOW": "1"},
+                            patch={"QUEUE_SLEEP": 0.2}) for i in range(3)]
+        for proc in procs:
+            self.assertEqual(self.finish(proc, 30)[:2], (0, "pong\n"))
+        runs = self.runs()
+        for earlier, later in zip(runs, runs[1:]):
+            self.assertGreaterEqual(later["time"], earlier["time"] + 0.9, "two ran at once")
+
+    def test_timeout_is_124(self):
+        started = time.time()
+        done = self.mw("-b", "codex", "-t", "1", "x", env={"MODE_codex": "slow"})
+        self.assertEqual((done.returncode, done.stdout), (124, b""))
+        self.assertLess(time.time() - started, 10)
+        self.assertIn("too big", done.stderr.decode())
+        self.assertEqual(self.ledger(), ["codex timeout in=0 out=0"])
+        self.assert_no_leftovers()
+
+    def test_cancel(self):
+        self.enable()
+        proc = self.start("-t", "60", "x", env={"MODE_codex": "slow"})
+        self.wait_for(self.runs, 10, "the codex worker")
+        prompt = glob.glob(os.path.join(self.state, "runs/*.prompt.md"))[0]
+        run_id = os.path.basename(prompt)[:-len(".prompt.md")]
+        self.assertEqual(self.ag("cancel", run_id).strip(), '{"ok": true}')
+        rc, out, err = self.finish(proc, 10)
+        self.assertEqual((rc, out), (130, ""))
+        self.assertNotIn("trying the next provider", err)
+        self.assertEqual(self.ledger(), ["codex cancelled in=0 out=0"])
+        self.assertEqual([record["provider"] for record in self.records()], ["codex"])
+        self.assertEqual(self.live_slots(), [])
+        self.assert_no_leftovers()
+
+    def test_failover_to_codex(self):
+        self.enable(first=False)
+        done = self.mw("do it", env={"MODE_minimax": "die"})
+        self.assertEqual(done.stdout.decode(), "pong\n", done.stderr.decode())
+        self.assertEqual(self.runs()[0]["prompt"], MW.FAILOVER_NOTE + "do it\n")
+        self.assertEqual(self.ledger(2)[1], "codex ok in=58634 out=147")
+
+    def test_failover_from_codex(self):
+        self.enable()
+        done = self.mw("do it", env={"MODE_codex": "fail"})
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+        self.assertEqual(self.runs()[0]["prompt"], "do it\n")
+        self.assertEqual(self.records("minimax")[0]["prompt"], MW.FAILOVER_NOTE + "do it\n")
+
+    def test_a_machine_with_cli_opencode_runs_codex_too(self):
+        write(os.path.join(self.bin, "opencode"), FAKE_OPENCODE.replace("@PYTHON@", PY), 0o755)
+        self.enable(cli="opencode")
+        done = self.mw("x")
+        self.assertEqual(done.stdout.decode(), "pong\n", done.stderr.decode())
+        self.assertEqual(self.runs()[-1]["argv"], codex_argv("read-only"))
+        done = self.mw("x", "--", "--allowedTools", "Edit", env={"MODE_codex": "fail"})
+        self.assertEqual(done.stdout.decode(), "RESULT-from-mm\n", done.stderr.decode())
+        self.assertEqual(self.runs()[-1]["argv"], codex_argv("workspace-write"))
+        os.unlink(os.path.join(self.bin, "opencode"))
+        done = self.mw("-b", "codex", "x")
+        self.assertEqual(done.stdout.decode(), "pong\n", "-b codex needs no opencode")
+
+    # --- finding it
+
+    def test_no_command_means_skipped_and_b_codex_is_127(self):
+        self.no_fallback_codex()
+        os.unlink(os.path.join(self.bin, "codex"))
+        self.enable()
+        done = self.mw("x")
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+        self.assertEqual(self.cooling_files("codex"), [])
+        done = self.mw("-b", "codex", "x")
+        self.assertEqual(done.returncode, 127)
+        self.assertIn("codex not found", done.stderr.decode())
+
+    def test_the_command_is_found_in_a_fallback_place(self):
+        os.unlink(os.path.join(self.bin, "codex"))
+        self.install(os.path.join(self.home, ".npm-global/bin/codex"))
+        self.enable()
+        done = self.mw("x")
+        self.assertEqual(done.stdout.decode(), "pong\n")
+        self.assertEqual(self.runs()[-1]["argv"], codex_argv("read-only"))
+
+    def test_no_sign_in_means_skipped(self):
+        os.unlink(os.path.join(self.home, ".codex/auth.json"))
+        self.enable()
+        for env in ({}, {"OPENAI_API_KEY": " "}):
+            done = self.mw("x", env=env)
+            self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n")
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(self.mw("x", env={"OPENAI_API_KEY": "sk-test"}).stdout.decode(), "pong\n")
+        write(os.path.join(self.root, "codex-home/auth.json"), "{}")
+        done = self.mw("x", env={"CODEX_HOME": os.path.join(self.root, "codex-home")})
+        self.assertEqual(done.stdout.decode(), "pong\n")
+        self.assertEqual(self.runs()[-1]["env"]["CODEX_HOME"], os.path.join(self.root, "codex-home"))
+
+    def test_disabled_by_default_and_b_still_reaches_it(self):
+        self.assertEqual(MW.DEFAULT_RULES["providers"]["codex"], {"enabled": False, "slots": 4})
+        self.assertNotIn("codex", MW.DEFAULT_RULES["order"])
+        self.assertFalse(any("codex" in models for models in MW.DEFAULT_RULES["levels"].values()))
+        self.assertEqual(self.mw("x").stdout.decode(), "RESULT-from-minimax\n")
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(self.mw("-b", "codex", "x").stdout.decode(), "pong\n")
+
+    # --- models
+
+    def test_codex_model(self):
+        self.mw("-b", "codex", "--codex-model", "gpt-5.5", "x")
+        self.assertEqual(self.runs()[-1]["argv"], codex_argv("read-only", "gpt-5.5"))
+        self.assertEqual(read(os.path.join(self.state, "ledger.tsv")).split("\t")[2], "gpt-5.5")
+        self.mw("-b", "codex", "--codex-model", "default", "x")
+        self.assertEqual(self.runs()[-1]["argv"], codex_argv("read-only"))
+
+    def test_a_full_name_in_the_rules_reaches_codex(self):
+        self.rules(lambda r: (enable_codex(r), r["levels"]["normal"].update(codex="gpt-5.5-codex")))
+        done = self.mw("x")
+        self.assertNotIn("using the default rules", done.stderr.decode())
+        self.assertEqual(self.runs()[-1]["argv"], codex_argv("read-only", "gpt-5.5-codex"))
+        self.mw("-l", "simple", "x")
+        self.assertEqual(self.runs()[-1]["argv"], codex_argv("read-only"), "default means no -m")
+
+    def test_model_validation(self):
+        def check(provider, model):
+            rules = copy.deepcopy(MW.DEFAULT_RULES)
+            rules["levels"]["normal"][provider] = model
+            return MW.validate_rules(rules)
+        for model in ("default", "gpt-5.5", "GPT-5.5-Codex", "codex-mini-latest"):
+            self.assertIsNone(check("codex", model), model)
+        for model in ("o3", "sonnet", "claude-opus-5-5", "gpt 5", "sk-proj-abc", "gpt-" + "x" * 80):
+            self.assertIsInstance(check("codex", model), str, model)
+        for provider in ("minimax", "zhipu", "claude", "qwen"):
+            for model in ("gpt-5.5", "codex-mini", "default"):
+                self.assertIsInstance(check(provider, model), str, (provider, model))
+        self.assertEqual({level: MW.LEVEL_FALLBACK[level]["codex"] for level in MW.LEVELS},
+                         {"simple": "default", "normal": "default", "hard": "default"})
+
+    # --- environment
+
+    def test_environment(self):
+        env = {"ANTHROPIC_BASE_URL": "http://elsewhere", "ANTHROPIC_API_KEY": "k", "ANTHROPIC_CUSTOM_HEADERS": "h",
+               "ANTHROPIC_DEFAULT_OPUS_MODEL": "o", "API_TIMEOUT_MS": "1", "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "1",
+               "OPENAI_API_KEY": "sk-test"}
+        done = self.mw("-b", "codex", "x", env=env)
+        self.assertEqual(done.stdout.decode(), "pong\n")
+        seen = self.runs()[-1]["env"]
+        self.assertEqual(seen["MM_WORKER_ACTIVE"], "1")
+        self.assertEqual(seen["OPENAI_API_KEY"], "sk-test")
+        for name in seen:
+            self.assertFalse(name.startswith("ANTHROPIC_"), name)
+        self.assertNotIn("API_TIMEOUT_MS", seen)
+        self.assertNotIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS", seen)
+
+    def test_usage_text(self):
+        text = self.mw("--help").stdout.decode()
+        self.assertIn("--backend auto|minimax|zhipu|claude|qwen|codex", text)
+        self.assertIn("--codex-model default|NAME", text)
+
+
+@unittest.skipUnless(shutil.which("bash"), "remote tests need bash")
+class CodexElsewhere(CodexBase):
+    FAST = {"RETRY_SLEEP": 0.2, "QUEUE_SLEEP": 0.2}
+
+    def setUp(self):
+        CodexBase.setUp(self)
+        self.env["PATH"] = self.sshbin + ":" + SYSTEM_PATH
+        # The target has codex, signed in, and its rules put it first.
+        self.install(os.path.join(self.remote, ".local/bin/codex"))
+        write(os.path.join(self.remote, ".codex/auth.json"), "{}")
+        rules = copy.deepcopy(MW.DEFAULT_RULES)
+        enable_codex(rules)
+        write(os.path.join(self.remote, ".config/mm-worker/rules.json"), json.dumps(rules))
+
+    def test_h_with_b_codex_is_refused(self):
+        done = self.mw("-H", "box", "-b", "codex", "x", patch=self.FAST)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("codex runs on this machine only", done.stderr.decode())
+        self.assertFalse(os.path.exists(self.env["FAKE_SSH_LOG"]))
+
+    def test_the_target_never_picks_codex(self):
+        done = self.mw("-H", "box", "x", patch=self.FAST)
+        self.assertEqual(done.stdout.decode(), "RESULT-from-minimax\n", done.stderr.decode())
+        self.assertEqual(self.runs(), [])
+        # Not even tried: the ledger has no failed codex attempt before it.
+        self.assertEqual(read(os.path.join(self.state, "ledger.tsv")).count("\n"), 1)
+        self.assertEqual(self.ledger(), ["minimax@box ok in=150 out=7"])
+        self.assertNotIn("codex", done.stderr.decode())
+        self.assertEqual(glob.glob(os.path.join(self.remote, ".cache/mm-worker/jobs/*-codex")), [])
+
+    def test_a_start_request_for_codex_finds_nothing(self):
+        request = {"op": "start", "run_id": "20261105-120000-1", "tried": [], "level": "normal",
+                   "backend": "codex", "timeout": None, "rdir": "proj", "extra": [], "name": False, "models": {}}
+        done = subprocess.run([PY, "-I", WORKER, "--remote", json.dumps(request)], cwd=self.remote,
+                              env=dict(self.environment(None), HOME=self.remote), stdout=subprocess.PIPE,
+                              timeout=30)
+        self.assertEqual(json.loads(done.stdout.decode().splitlines()[-1])["state"], "none")
+        self.assertEqual(self.runs(), [])
+
+
 class Rules(Base):
     def provider_of(self, done):
         self.assertEqual(done.returncode, 0, done.stderr.decode())
@@ -1260,10 +1728,10 @@ class Arguments(Base):
         done = self.mw("--status", env={"MM_WORKER_SLOTS_CLAUDE": "2"})
         err, out = done.stderr.decode(), done.stdout.decode()
         self.assertEqual(done.returncode, 0)
-        self.assertIn("[mm-worker] automatic dispatch uses: minimax zhipu claude (only with -b: qwen)", err)
+        self.assertIn("[mm-worker] automatic dispatch uses: minimax zhipu claude (only with -b: qwen codex)", err)
         self.assertIn("[mm-worker] minimax available (not cooling down)", err)
         self.assertRegex(err, r"\[mm-worker\] zhipu unavailable, 2[45] minutes left \(quota used up \(HTTP 402\)\)")
-        self.assertIn("[mm-worker] slots in use: minimax 0/6  zhipu 0/4  claude 1/2  qwen 0/4", err)
+        self.assertIn("[mm-worker] slots in use: minimax 0/6  zhipu 0/4  claude 1/2  qwen 0/4  codex 0/4", err)
         lines = out.splitlines()
         self.assertEqual(lines[0], "Last 15 runs:")
         self.assertEqual(len(lines), 3)
@@ -1577,7 +2045,7 @@ class Source(unittest.TestCase):
     def test_header(self):
         lines = self.text.splitlines()
         self.assertEqual(lines[0], "#!/usr/bin/env python3")
-        self.assertEqual(lines[1], "MM_WORKER_VERSION = 4")
+        self.assertEqual(lines[1], "MM_WORKER_VERSION = 5")
 
     def test_python_3_9_grammar(self):
         ast.parse(self.text, feature_version=(3, 9))

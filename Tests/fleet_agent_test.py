@@ -335,6 +335,199 @@ def codex_message(when, text=SECRET):
                        "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
 
 
+class CodexWorker(Base):
+    """codex as an mm-worker provider: configured, rules, a running worker's stream, models."""
+
+    def setUp(self):
+        super().setUp()
+        # Nothing this machine has installed or set may show through.
+        self.bin = os.path.join(self.home, "bin")
+        os.makedirs(self.bin)
+        self.agent.CLAUDE_DIRS = self.agent.CODEX_DIRS = ()
+        self.agent.CODEX_HOMES = (os.path.join(self.home, ".codex"),)
+        os.environ["PATH"] = self.bin
+        os.environ.pop("OPENAI_API_KEY", None)
+
+    def put(self, relative, text="", mode=0o644):
+        path = os.path.join(self.home, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+        os.chmod(path, mode)
+        return path
+
+    def configured(self):
+        return self.agent.Dispatcher().read(time.time())["providers"]["codex"]["configured"]
+
+    def test_configured_needs_the_command_and_a_login_or_key(self):
+        auth = os.path.join(self.home, ".codex/auth.json")
+        elsewhere = os.path.join(self.home, "elsewhere/auth.json")
+        for command in (False, True):
+            for login in ("none", "auth.json", "CODEX_HOME", "key", "empty key"):
+                for path in (os.path.join(self.bin, "codex"), auth, elsewhere):
+                    if os.path.exists(path):
+                        os.unlink(path)
+                os.environ.pop("OPENAI_API_KEY", None)
+                self.agent.CODEX_HOMES = (os.path.join(self.home, ".codex"),)
+                if command:
+                    self.put("bin/codex", "#!/bin/sh\ntouch %s\n" % os.path.join(self.home, "ran"), mode=0o755)
+                if login == "auth.json":
+                    self.put(".codex/auth.json", json.dumps({"OPENAI_API_KEY": FAKE_KEY}))
+                elif login == "CODEX_HOME":
+                    self.agent.CODEX_HOMES = (os.path.dirname(elsewhere), os.path.join(self.home, ".codex"))
+                    self.put("elsewhere/auth.json", json.dumps({"tokens": {"access_token": FAKE_KEY}}))
+                elif login == "key":
+                    os.environ["OPENAI_API_KEY"] = FAKE_KEY
+                elif login == "empty key":
+                    os.environ["OPENAI_API_KEY"] = ""
+                opened = []
+                real_open = open
+
+                def spy(path, *args, **kwargs):
+                    opened.append(os.path.abspath(str(path)))
+                    return real_open(path, *args, **kwargs)
+
+                with mock.patch("builtins.open", spy):
+                    expected = command and login in ("auth.json", "CODEX_HOME", "key")
+                    self.assertIs(self.configured(), expected, (command, login))
+                    report = self.report()
+                self.assertIs(report["dispatcher"]["providers"]["codex"]["configured"], expected)
+                self.assertNotIn(auth, opened)
+                self.assertNotIn(elsewhere, opened)
+                self.assertNotIn(FAKE_KEY, json.dumps(report))
+        self.assertFalse(os.path.exists(os.path.join(self.home, "ran")))
+
+    def write_dispatcher(self, version):
+        self.put(".local/bin/mm-worker", "#!/usr/bin/env python3\nMM_WORKER_VERSION = %d\n" % version)
+
+    def codex_rules(self, model="default"):
+        rules = copy.deepcopy(self.agent.DEFAULT_RULES)
+        rules["providers"]["codex"]["enabled"] = True
+        rules["order"].append("codex")
+        rules["levels"]["hard"]["codex"] = model
+        return rules
+
+    def rules_set(self, rules, expected="0"):
+        return self.agent.rules_set(base64.b64encode(json.dumps(rules).encode()).decode(), expected)
+
+    def test_rules_naming_codex_wait_for_dispatcher_5(self):
+        rules_path = os.path.join(self.home, ".config/mm-worker/rules.json")
+        for version in (None, 2, 4):
+            if version is not None:
+                self.write_dispatcher(version)
+            answer = self.rules_set(self.codex_rules())
+            self.assertEqual(answer, {"ok": False, "error":
+                                      "this machine's mm-worker is too old for codex: update it first"}, version)
+            # Only listed and disabled still names it.
+            self.assertIs(self.rules_set(copy.deepcopy(self.agent.DEFAULT_RULES))["ok"], False, version)
+            self.assertFalse(os.path.exists(rules_path))
+        without = copy.deepcopy(self.agent.DEFAULT_RULES)
+        del without["providers"]["codex"]
+        self.assertEqual(self.rules_set(without), {"ok": True, "revision": 1})
+        # A reset leaves codex out for a dispatcher that would refuse the file.
+        self.assertEqual(self.agent.rules_reset("1"), {"ok": True, "revision": 2})
+        self.assertEqual(self.agent.load_rules(), (dict(without, revision=2), True))
+        self.write_dispatcher(5)
+        self.assertEqual(self.rules_set(self.codex_rules(), "2"), {"ok": True, "revision": 3})
+        self.assertEqual(self.agent.load_rules()[0]["levels"]["hard"]["codex"], "default")
+        self.assertEqual(self.agent.rules_reset("3"), {"ok": True, "revision": 4})
+        self.assertEqual(self.agent.load_rules(), (dict(self.agent.DEFAULT_RULES, revision=4), True))
+
+    def test_codex_models_are_default_or_a_gpt_or_codex_full_name(self):
+        self.write_dispatcher(5)
+        for model in ("default", "gpt-5.5", "GPT-5.5-codex", "codex-mini-latest"):
+            self.assertIsNone(self.agent.rules_error(self.codex_rules(model)), model)
+        for model in ("Default", "claude-opus-5-5", "o3", "gpt", "gpt-x ; rm -rf ~", "gpt-" + "x" * 90, 5, None,
+                      FAKE_KEY):
+            error = self.agent.rules_error(self.codex_rules(model))
+            self.assertIn("levels.hard.codex", error or "", model)
+            self.assertNotIn(FAKE_KEY, error)
+            answer = self.rules_set(self.codex_rules(model))
+            self.assertIs(answer["ok"], False, model)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config/mm-worker/rules.json")))
+
+    def running_codex(self, *events):
+        folder = os.path.join(self.home, ".cache/mm-worker/jobs/20261101-000000-1-codex")
+        os.makedirs(folder)
+        open(os.path.join(folder, "started"), "w").close()
+        with open(os.path.join(folder, "pid"), "w") as handle:
+            handle.write(str(os.getpid()))
+        with open(os.path.join(folder, "out.json"), "w") as handle:
+            handle.write("".join(json.dumps(event) + "\n" for event in events))
+        return os.path.join(folder, "out.json")
+
+    def command(self, kind, ident, output=""):
+        return {"type": kind, "item": {"id": ident, "type": "command_execution",
+                                       "command": "/bin/zsh -lc 'cat %s'" % SECRET, "aggregated_output": output,
+                                       "exit_code": None if kind == "item.started" else 0,
+                                       "status": "in_progress" if kind == "item.started" else "completed"}}
+
+    def turn(self, input, cached, output, write=0, reasoning=0):
+        return {"type": "turn.completed", "usage": {
+            "input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": write,
+            "output_tokens": output, "reasoning_output_tokens": reasoning}}
+
+    def test_a_running_codex_worker_reports_steps_tool_tokens_and_model_only(self):
+        self.running_codex(
+            {"type": "system", "subtype": "init", "model": "gpt-5.5"},
+            {"type": "thread.started", "thread_id": "01a1-thread"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": SECRET}},
+            self.command("item.started", "item_1"),
+            self.command("item.completed", "item_1", SECRET + "\n"),
+            {"type": "item.completed", "item": {"id": "item_2", "type": "error", "message": SECRET}},
+            self.command("item.started", "item_3"),
+            self.command("item.completed", "item_3", "x" * 5000 + SECRET),
+            {"type": "item.completed", "item": {"id": "item_4", "type": "agent_message", "text": SECRET}},
+            self.turn(58634, 44160, 147, reasoning=66),
+            {"type": "turn.started"},
+            self.turn(1000, 400, 10, write=7))
+        worker = self.report()["workers"][0]
+        self.assertEqual(worker["state"], "running")
+        self.assertEqual(worker["steps"], 2)
+        self.assertEqual(worker["lastTool"], "Bash")
+        self.assertEqual(worker["model"], "gpt-5.5")
+        self.assertEqual(worker["usage"], {"input": 14474 + 600, "output": 157, "cacheRead": 44560, "cacheWrite": 7})
+        for key in ("lastFile", "sessionId"):
+            self.assertNotIn(key, worker)
+        self.assertNotIn(SECRET, json.dumps(worker))
+        self.assertNotIn("zsh", json.dumps(worker))
+
+    def test_progress_is_read_as_the_stream_grows_and_restarts_with_it(self):
+        path = self.running_codex({"type": "system", "subtype": "init", "model": "codex"})
+        streams = self.agent.WorkerStreams()
+        report = streams.progress(path, time.time())
+        self.assertEqual(report["model"], "codex")
+        self.assertNotIn("steps", report)
+        self.assertNotIn("usage", report)
+        line = json.dumps(self.command("item.started", "item_1"))
+        with open(path, "a") as handle:
+            handle.write(line[:40])
+        self.assertNotIn("steps", streams.progress(path, time.time()))
+        with open(path, "a") as handle:
+            handle.write(line[40:] + "\n" + json.dumps(self.turn(100, 60, 5)) + "\n")
+        report = streams.progress(path, time.time())
+        self.assertEqual((report["steps"], report["lastTool"]), (1, "Bash"))
+        self.assertEqual(report["usage"], {"input": 40, "output": 5, "cacheRead": 60, "cacheWrite": 0})
+        # mm-worker keeps only the result line once it is done: tokens are not counted twice.
+        with open(path, "w") as handle:
+            handle.write(json.dumps(self.turn(10, 0, 1)) + "\n")
+        self.assertEqual(streams.progress(path, time.time())["usage"],
+                         {"input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0})
+
+    def test_models_never_asks_codex(self):
+        os.environ["OPENAI_API_KEY"] = FAKE_KEY
+        self.put(".codex/auth.json", json.dumps({"OPENAI_API_KEY": FAKE_KEY}))
+        self.put(".config/codex/env", "OPENAI_API_KEY=%s\nCODEX_API_HOST=https://example.invalid\n" % FAKE_KEY)
+        self.put("bin/codex", "#!/bin/sh\n", mode=0o755)
+        with mock.patch.object(self.agent, "_model_page", side_effect=AssertionError("contacted")) as page, \
+                mock.patch.object(self.agent.socket, "create_connection", side_effect=AssertionError("network")):
+            answer = self.agent.models_command()
+        self.assertEqual(answer, {"ok": True, "providers": {}})
+        self.assertFalse(page.called)
+        self.assertNotIn(FAKE_KEY, json.dumps(answer))
+
+
 class Codex(Base):
     """codex writes its own session logs, with one token_count event per reply."""
 
@@ -1027,6 +1220,9 @@ class DispatcherBase(Base):
     def dispatcher(self, now=None):
         return self.agent.Dispatcher().read(time.time() if now is None else now)
 
+    def write_dispatcher(self, version):
+        self.put(".local/bin/mm-worker", "#!/usr/bin/env python3\nMM_WORKER_VERSION = %d\n" % version)
+
     def cli(self, *args):
         """Run the agent as the app does: the script on stdin, arguments after `-`."""
         with open(SCRIPT, "rb") as script:
@@ -1048,7 +1244,7 @@ class DispatcherReport(DispatcherBase):
         self.assertEqual(report["claudeInstalled"], False)
         self.assertEqual(report["rules"], self.agent.DEFAULT_RULES)
         self.assertEqual(report["rulesValid"], True)
-        self.assertEqual(sorted(report["providers"]), ["claude", "minimax", "qwen", "zhipu"])
+        self.assertEqual(sorted(report["providers"]), ["claude", "codex", "minimax", "qwen", "zhipu"])
         for provider in report["providers"].values():
             self.assertEqual(provider, {"configured": False, "used": 0, "cooling": False, "coolingReason": ""})
         self.assertEqual(report["remoteRunner"], False)
@@ -1225,6 +1421,10 @@ class DispatcherReport(DispatcherBase):
 
 
 class Rules(DispatcherBase):
+    def setUp(self):
+        super().setUp()
+        self.write_dispatcher(5)  # the defaults name codex
+
     def rules(self, **changes):
         rules = copy.deepcopy(self.agent.DEFAULT_RULES)
         rules.update(changes)
@@ -1483,7 +1683,7 @@ class KeyPrivacy(DispatcherBase):
             self.assertNotIn(FAKE_KEY, handle.read())
 
     def test_rules_take_a_full_name_for_its_own_provider_only(self):
-        self.write_dispatcher(3)
+        self.write_dispatcher(5)
         rules = self.rules_with_model("MiniMax-M2.5")
         self.assertIs(self.cli("rules-set", encode(rules), "0")[0]["ok"], True)
         for bad in ("glm-5.1", "m3 ; rm -rf x", "MiniMax-" + "x" * 90):
@@ -1494,14 +1694,15 @@ class KeyPrivacy(DispatcherBase):
     def test_full_names_wait_for_a_dispatcher_that_takes_them(self):
         # The old one would call the file invalid and go back to its defaults.
         self.write_dispatcher(1)
-        answer = self.cli("rules-set", encode(self.rules_with_model("MiniMax-M2.5")), "0")[0]
+        answer = self.cli("rules-set", encode(self.rules_with_model("MiniMax-M2.5", codex=False)), "0")[0]
         self.assertIs(answer["ok"], False)
         self.assertIn("too old", answer["error"])
         self.assertFalse(os.path.exists(self.rules_path))
-        self.assertIs(self.cli("rules-set", encode(self.rules_with_model("m27")), "0")[0]["ok"], True)
+        self.assertIs(self.cli("rules-set", encode(self.rules_with_model("m27", codex=False)), "0")[0]["ok"], True)
 
     def test_the_cli_rule_waits_for_a_dispatcher_and_for_opencode(self):
         rules = copy.deepcopy(self.agent.DEFAULT_RULES)
+        del rules["providers"]["codex"]  # dispatchers 2 and 3 don't know it
         rules["cli"] = "opencode"
         self.write_dispatcher(2)
         self.assertIn("too old", self.cli("rules-set", encode(rules), "0")[0]["error"])
@@ -1517,12 +1718,11 @@ class KeyPrivacy(DispatcherBase):
         rules["cli"] = "nope"
         self.assertIn("cli must be", self.cli("rules-set", encode(rules), "1")[0]["error"])
 
-    def write_dispatcher(self, version):
-        self.put(".local/bin/mm-worker", "#!/usr/bin/env python3\nMM_WORKER_VERSION = %d\n" % version)
-
-    def rules_with_model(self, model):
+    def rules_with_model(self, model, codex=True):
         rules = copy.deepcopy(self.agent.DEFAULT_RULES)
         rules["levels"]["simple"]["minimax"] = model
+        if not codex:
+            del rules["providers"]["codex"]  # as the app saves to a dispatcher older than 5
         return rules
 
 

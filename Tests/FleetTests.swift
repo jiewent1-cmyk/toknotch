@@ -241,6 +241,17 @@ final class FleetTests: XCTestCase {
     private let documentedRules = """
     {"version":1,"revision":0,"balance":"proportional","order":["minimax","zhipu","claude"],\
     "providers":{"minimax":{"enabled":true,"slots":8},"zhipu":{"enabled":true,"slots":4},\
+    "claude":{"enabled":true,"slots":4},"qwen":{"enabled":false,"slots":4},\
+    "codex":{"enabled":false,"slots":4}},\
+    "levels":{"simple":{"minimax":"fast","zhipu":"flash","claude":"sonnet"},\
+    "normal":{"minimax":"m3","zhipu":"flash","claude":"sonnet"},"hard":{"claude":"claude-opus-5-5"}},\
+    "defaults":{"timeoutSeconds":900,"cooldownSeconds":1800}}
+    """
+
+    /// The defaults before codex, as real machines' files hold them today.
+    private let rulesBeforeCodex = """
+    {"version":1,"revision":0,"balance":"proportional","order":["minimax","zhipu","claude"],\
+    "providers":{"minimax":{"enabled":true,"slots":8},"zhipu":{"enabled":true,"slots":4},\
     "claude":{"enabled":true,"slots":4},"qwen":{"enabled":false,"slots":4}},\
     "levels":{"simple":{"minimax":"fast","zhipu":"flash","claude":"sonnet"},\
     "normal":{"minimax":"m3","zhipu":"flash","claude":"sonnet"},"hard":{"claude":"claude-opus-5-5"}},\
@@ -297,7 +308,7 @@ final class FleetTests: XCTestCase {
         XCTAssertEqual(issues { $0.order = ["minimax", "zhipu", "claude", "claude"] }, [.order])
         XCTAssertEqual(issues { $0.order = ["minimax", "zhipu", "claude", "nope"] }, [.order])
         XCTAssertEqual(issues { $0.order = ["qwen", "claude", "zhipu", "minimax"] }, [])
-        XCTAssertEqual(FleetRules.defaults.normalized.order, ["minimax", "zhipu", "claude", "qwen"])
+        XCTAssertEqual(FleetRules.defaults.normalized.order, ["minimax", "zhipu", "claude", "codex", "qwen"])
     }
 
     func testEditingKeepsRulesConsistent() {
@@ -308,7 +319,7 @@ final class FleetTests: XCTestCase {
 
         rules = .defaults
         rules.move("qwen", by: -1)
-        XCTAssertEqual(rules.order, ["minimax", "zhipu", "qwen", "claude"])
+        XCTAssertEqual(rules.order, ["minimax", "zhipu", "qwen", "claude", "codex"])
         rules = .defaults
         rules.move("minimax", by: -1)
         XCTAssertEqual(rules, .defaults)
@@ -418,6 +429,108 @@ final class FleetTests: XCTestCase {
         XCTAssertEqual(editor.draft.revision, 7)
         XCTAssertFalse(editor.isDirty)
         XCTAssertEqual(editor.draft.balance, FleetRules.balanceProportional)
+    }
+
+    // MARK: Codex
+
+    func testCodexRulesAndModels() {
+        XCTAssertEqual(FleetRules.providerNames.last, "codex")
+        XCTAssertEqual(FleetRules.allowedModels["codex"]?.map(\.id), ["default"])
+        XCTAssertTrue(FleetRules.isAllowedModel("default", provider: "codex"))
+        XCTAssertTrue(FleetRules.isAllowedModel("gpt-5.5", provider: "codex"))
+        XCTAssertTrue(FleetRules.isAllowedModel("GPT-5.5-Codex", provider: "codex"))
+        XCTAssertTrue(FleetRules.isAllowedModel("codex-mini-latest", provider: "codex"))
+        XCTAssertFalse(FleetRules.isAllowedModel("o3", provider: "codex"))
+        XCTAssertFalse(FleetRules.isAllowedModel("sonnet", provider: "codex"))
+        XCTAssertFalse(FleetRules.isAllowedModel("gpt-5.5 x", provider: "codex"))
+        // The prefixes keep codex's models and claude's apart.
+        XCTAssertFalse(FleetRules.isAllowedModel("default", provider: "claude"))
+        XCTAssertFalse(FleetRules.isAllowedModel("gpt-5.5", provider: "claude"))
+        XCTAssertFalse(FleetRules.isAllowedModel("claude-opus-5-5", provider: "codex"))
+
+        XCTAssertEqual(issues { $0.levels["hard"]?["codex"] = "default" }, [])
+        XCTAssertEqual(issues { $0.levels["hard"]?["codex"] = "gpt-5.5" }, [])
+        XCTAssertEqual(issues { $0.levels["hard"]?["codex"] = "sonnet" }, [.model(level: "hard", provider: "codex")])
+        XCTAssertEqual(issues { $0.providers["codex"]?.slots = 33 }, [.slots(provider: "codex")])
+        // Enabled, it has to be in `order` like any other.
+        XCTAssertEqual(issues { $0.providers["codex"]?.enabled = true }, [.order])
+        var rules = FleetRules.defaults
+        rules.setEnabled(true, for: "codex")
+        XCTAssertEqual(rules.order.last, "codex")
+        XCTAssertEqual(rules.validate(), [])
+
+        XCTAssertEqual(FleetRules.menuModels(provider: "codex", listed: [], current: nil,
+                                             acceptsFullNames: true).map(\.id), ["default"])
+        XCTAssertEqual(FleetRules.menuModels(provider: "codex", listed: [], current: "gpt-5.5",
+                                             acceptsFullNames: true).map(\.id), ["default", "gpt-5.5"])
+    }
+
+    /// Nothing changes for a machine until someone turns codex on.
+    func testCodexIsOffByDefaultAndInNoLevelOrOrder() {
+        let defaults = FleetRules.defaults
+        XCTAssertEqual(defaults.providers["codex"], FleetRules.Provider(enabled: false, slots: 4))
+        XCTAssertFalse(defaults.order.contains("codex"))
+        for level in FleetRules.levelNames {
+            XCTAssertNil(defaults.levels[level]?["codex"], level)
+        }
+        XCTAssertEqual(FleetRules.bundledDispatcherVersion, 5)
+        XCTAssertEqual(FleetRules.codexDispatcherVersion, 5)
+    }
+
+    /// Real machines' files have no codex entry today.
+    func testRulesWithoutCodexStillDecodeAndValidate() throws {
+        let rules = try JSONDecoder().decode(FleetRules.self, from: Data(rulesBeforeCodex.utf8))
+        XCTAssertNil(rules.providers["codex"])
+        XCTAssertEqual(rules.validate(), [])
+        XCTAssertFalse(rules.isEnabled("codex"))
+        XCTAssertEqual(rules.slots("codex"), 4)
+        XCTAssertEqual(rules.displayOrder.last, "codex")
+        XCTAssertEqual(rules.normalized.order, ["minimax", "zhipu", "claude", "qwen"])
+        XCTAssertEqual(rules.forDispatcher(version: 4), rules)
+
+        let snapshot = try XCTUnwrap(FleetSnapshot.decode(line: line(dispatcher: dispatcherJSON(rules, version: 4))))
+        XCTAssertEqual(snapshot.dispatcher?.rules, rules)
+    }
+
+    func testSavingToAnOlderDispatcherRemovesCodexOnly() {
+        var withCodex = FleetRules.defaults
+        withCodex.revision = 3
+        withCodex.balance = FleetRules.balancePriority
+        withCodex.levels["normal"]?["claude"] = "claude-sonnet-5-5"
+        withCodex.setSlots(6, for: "codex")
+        withCodex.setEnabled(true, for: "codex")
+        withCodex.setModel("default", level: "hard", provider: "codex")
+        XCTAssertEqual(withCodex.validate(), [])
+
+        var without = withCodex
+        without.providers["codex"] = nil
+        without.order.removeAll { $0 == "codex" }
+        without.levels["hard"]?["codex"] = nil
+        XCTAssertEqual(withCodex.forDispatcher(version: 4), without)
+        XCTAssertEqual(withCodex.forDispatcher(version: 0), without)
+        XCTAssertEqual(withCodex.forDispatcher(version: 5), withCodex)
+        XCTAssertEqual(withCodex.forDispatcher(version: 6), withCodex)
+        XCTAssertEqual(FleetRules.knownProviders(dispatcherVersion: 4), ["minimax", "zhipu", "claude", "qwen"])
+        XCTAssertEqual(FleetRules.knownProviders(dispatcherVersion: 5), FleetRules.providerNames)
+
+        // What is sent and the draft agree, so the save leaves the editor clean.
+        var editor = FleetRulesEditor(rules: rules(revision: 3), valid: true)
+        editor.draft.balance = FleetRules.balancePriority
+        let sent = editor.beginSave(dispatcherVersion: 4)
+        XCTAssertNil(sent.providers["codex"])
+        XCTAssertEqual(sent.order, ["minimax", "zhipu", "claude", "qwen"])
+        XCTAssertEqual(sent.providers["qwen"], FleetRules.Provider(enabled: false, slots: 4))
+        XCTAssertEqual(sent.balance, FleetRules.balancePriority)
+        XCTAssertEqual(sent.levels, FleetRules.defaults.levels)
+        XCTAssertEqual(sent.revision, 3)
+        XCTAssertEqual(sent.validate(), [])
+        editor.saved(sent, revision: 4, now: moment)
+        XCTAssertFalse(editor.isDirty)
+
+        // The bundled dispatcher keeps it.
+        var current = FleetRulesEditor(rules: rules(revision: 3), valid: true)
+        current.draft.balance = FleetRules.balancePriority
+        XCTAssertEqual(current.beginSave().providers["codex"], FleetRules.Provider(enabled: false, slots: 4))
     }
 
     // MARK: Commands

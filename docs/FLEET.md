@@ -337,6 +337,9 @@ echo "summarise these notes" | mm-worker
 # Force a provider, even a disabled one
 mm-worker -b zhipu "refactor the cache module"
 
+# Run it with OpenAI's Codex CLI, allowed to edit files in this folder
+mm-worker -b codex "fix the typo in README.md" -- --allowedTools Read,Edit
+
 # What this machine would use now, what is cooling, the last 15 runs
 mm-worker --status
 
@@ -349,17 +352,18 @@ mm-worker --kill 20260612-101502-4311
 ```
 
 The prompt comes from an argument, `-f file`, or stdin. Anything after `--`
-is passed to Claude Code.
+is passed to Claude Code. For opencode and codex, only `--allowedTools` is
+accepted there, and it is translated.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `2` | Bad usage: unknown level, no or empty prompt, or — with `-H` — a target that is unreachable or lacks `mm-remote-run` |
+| `2` | Bad usage: unknown level, no or empty prompt, an argument after `--` that the forced provider's agent can't honour, or — with `-H` — a target that is unreachable or lacks `mm-remote-run` |
 | `3` | Refused: `mm-worker` was started inside another worker; nested dispatch is not allowed |
 | `124` | The run timed out (a remote timeout is reported as `124` too) |
-| `127` | Claude Code not found (local runs) |
+| `127` | Claude Code not found (local runs), or `codex` not found with `-b codex` |
 | `130` | Cancelled or interrupted; the task is not retried on another provider |
 | anything else | Failure; with automatic dispatch the task moves to the next provider |
 
@@ -368,12 +372,13 @@ is passed to Claude Code.
 | Option | Meaning |
 |---|---|
 | `-l, --level simple\|normal\|hard` | Task level (default `normal`, or `simple` with `-m fast`) |
-| `-b, -P, --backend auto\|minimax\|zhipu\|claude\|qwen` | Force a provider, even a disabled one (default `auto`) |
+| `-b, -P, --backend auto\|minimax\|zhipu\|claude\|qwen\|codex` | Force a provider, even a disabled one (default `auto`) |
 | `-m, --mm-model m3\|m27\|fast\|full name` | MiniMax model |
 | `-z, --zp-model flash\|full name` | Zhipu model |
 | `--cli claude\|opencode` | Agent that runs the worker, on this machine |
 | `-q, --qw-model glm\|max\|flash\|lite\|ds` | Qwen endpoint model |
 | `-c, --claude-model MODEL` | Claude model (opus only for hard) |
+| `--codex-model default\|full name` | Codex model; `default` passes no `-m`, so codex chooses |
 | `-t, --timeout SEC` | Timeout for one run (default from the rules) |
 | `-n, --name NAME` | Task name shown in Fleet |
 | `-f FILE` | Read the prompt from a file |
@@ -394,6 +399,24 @@ top of `mm-worker.py`.
 
 A provider with no key on this machine is skipped by automatic dispatch;
 forcing it with `-b` still reaches it, as a deliberate override.
+
+### Codex
+
+The `codex` provider runs a worker with OpenAI's Codex CLI on this machine,
+whatever agent the rule `cli` names. It is off by default; turn it on in the
+rules, or force it with `-b codex`. Automatic dispatch uses it only when the
+`codex` command is installed and signed in (`~/.codex/auth.json`, or
+`OPENAI_API_KEY`). It runs with your Codex sign-in, but not your `config.toml`.
+
+Codex has sandboxes rather than per-tool permissions, so `--allowedTools`
+chooses the tightest one that fits: `read-only` unless a write tool (`Edit`,
+`Write`, `MultiEdit`, `NotebookEdit`) or plain `Bash` is named, then
+`workspace-write`. A Bash allowlist can't be enforced: `Bash(git log:*)` lets
+codex run any command the sandbox allows. Tools with no equivalent, such as
+`WebFetch` or MCP tools, stay denied, and the sandbox has no network. Any other
+argument after `--` stops a `-b codex` task, and makes automatic dispatch use
+another provider. Codex runs on this machine only: `-H host -b codex` is
+refused. See [FLEET-RULES.md](FLEET-RULES.md#codex).
 
 ### Running a task on another machine
 

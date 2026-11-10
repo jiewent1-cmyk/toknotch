@@ -101,13 +101,14 @@ RULES_LOCK = os.path.join(RULES_DIR, ".rules.lock")
 # ssh without a login shell has a thin PATH, so these are checked as well.
 CLAUDE_DIRS = (os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
 
-PROVIDERS = ("minimax", "zhipu", "claude", "qwen")
+PROVIDERS = ("minimax", "zhipu", "claude", "qwen", "codex")
 API_KEYS = {"minimax": "MINIMAX_API_KEY", "zhipu": "ZHIPU_API_KEY", "qwen": "QWEN_API_KEY"}
 MODELS = {
     "minimax": ("m3", "m27", "fast"),
     "zhipu": ("flash",),
     "claude": ("sonnet", "haiku", "claude-opus-5-5"),
     "qwen": ("glm", "max", "flash", "lite", "ds"),
+    "codex": ("default",),  # pass no model and let codex choose
 }
 LEVELS = ("simple", "normal", "hard")
 
@@ -119,6 +120,7 @@ MODEL_PREFIXES = {
     "zhipu": ("glm-",),
     "claude": ("claude-",),
     "qwen": ("qwen", "glm-", "deepseek-"),
+    "codex": ("gpt-", "codex-"),
 }
 FULL_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}")
 
@@ -134,6 +136,9 @@ FULL_NAMES_DISPATCHER = 2
 # The first mm-worker that reads the rule "cli", for the same reason.
 CLI_DISPATCHER = 3
 CLIS = ("claude", "opencode")
+# The first mm-worker that knows the provider codex. An older one would call
+# rules naming it invalid, the same way.
+CODEX_DISPATCHER = 5
 OPENCODE_DIRS = (os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".opencode", "bin"),
                  "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
 CODEX_DIRS = (os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".npm-global", "bin"),
@@ -164,6 +169,7 @@ DEFAULT_RULES = {
         "zhipu": {"enabled": True, "slots": 4},
         "claude": {"enabled": True, "slots": 4},
         "qwen": {"enabled": False, "slots": 4},
+        "codex": {"enabled": False, "slots": 4},
     },
     "levels": {
         "simple": {"minimax": "fast", "zhipu": "flash", "claude": "sonnet"},
@@ -970,6 +976,7 @@ class WorkerStreams:
             return {}
         if stat.st_size < state["offset"]:
             state.update(offset=0, pending=b"", messages=set())
+            state.pop("usage", None)  # a sum, so it starts again with the file
         if stat.st_size > state["offset"]:
             self._read(path, state)
         report = {"idleSeconds": max(0, int(now - stat.st_mtime))}
@@ -978,7 +985,31 @@ class WorkerStreams:
         for key in ("sessionId", "model", "lastTool", "lastFile"):
             if state.get(key):
                 report[key] = state[key]
+        if state.get("usage"):
+            report["usage"] = dict(state["usage"])
         return report
+
+    def _codex_line(self, event, state):
+        # Nothing here ties the run to a session for usage_by_session, so
+        # tokens come from the stream. Commands, their output and agent text
+        # are never kept: only that a command ran.
+        if event["type"] == "item.started":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "command_execution":
+                state["messages"].add(("codex", str(item.get("id"))))
+                state["lastTool"] = "Bash"
+                state["lastFile"] = ""
+            return
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            return
+        cached = _count(usage, "cached_input_tokens")
+        total = state.setdefault("usage", _empty_usage())
+        # Cached input is part of input_tokens, and reasoning part of output_tokens.
+        total["input"] += max(0, _count(usage, "input_tokens") - cached)
+        total["output"] += _count(usage, "output_tokens")
+        total["cacheRead"] += cached
+        total["cacheWrite"] += _count(usage, "cache_write_input_tokens")
 
     def _opencode_line(self, event, state):
         if event.get("sessionID"):
@@ -1022,7 +1053,8 @@ class WorkerStreams:
         # Tool results make up most of a stream, and they can be huge.
         head = line[:200]
         if (b'"assistant"' not in head and b'"init"' not in head and b'"tool_use"' not in head
-                and b'"step_finish"' not in head):
+                and b'"step_finish"' not in head and b'"item.started"' not in head
+                and b'"turn.completed"' not in head):
             return
         try:
             event = json.loads(line)
@@ -1034,6 +1066,9 @@ class WorkerStreams:
             state["sessionId"] = event["session_id"]
         if event.get("type") in ("tool_use", "step_finish"):
             self._opencode_line(event, state)
+            return
+        if event.get("type") in ("item.started", "turn.completed"):
+            self._codex_line(event, state)
             return
         if event.get("type") == "system" and event.get("model"):
             state["model"] = event["model"]
@@ -1500,6 +1535,17 @@ def codex_installed():
     return False
 
 
+def codex_signed_in():
+    """Whether codex has a login file. It is only tested for existence, never opened."""
+    return any(os.path.isfile(os.path.join(folder, "auth.json")) for folder in CODEX_HOMES)
+
+
+def codex_configured():
+    """What mm-worker needs to run codex: the command, and a login or a key.
+    The key's value is never read beyond being non-empty."""
+    return codex_installed() and (codex_signed_in() or bool(os.environ.get("OPENAI_API_KEY")))
+
+
 def remote_runner_installed():
     """Whether mm-remote-run is there to take tasks sent with -H. It is never run."""
     return os.path.isfile(REMOTE_RUNNER) and os.access(REMOTE_RUNNER, os.X_OK)
@@ -1554,7 +1600,8 @@ def _dispatcher_files():
         if len(key) >= 4:
             reason = reason.replace(key, "[hidden]")  # a provider's error may quote the key back
         providers[provider] = {
-            "configured": claude if provider == "claude" else bool(key),
+            "configured": (claude if provider == "claude" else codex_configured() if provider == "codex"
+                           else bool(key)),
             "until": until,
             "reason": reason[:200],
         }
@@ -1683,6 +1730,8 @@ def rules_set(encoded, expected):
         return {"ok": False, "error": error}
     if uses_full_names(rules) and dispatcher_version()[1] < FULL_NAMES_DISPATCHER:
         return {"ok": False, "error": "this machine's mm-worker is too old for these models: update it first"}
+    if "codex" in rules["providers"] and dispatcher_version()[1] < CODEX_DISPATCHER:
+        return {"ok": False, "error": "this machine's mm-worker is too old for codex: update it first"}
     if "cli" in rules and dispatcher_version()[1] < CLI_DISPATCHER:
         return {"ok": False, "error": "this machine's mm-worker is too old to choose a CLI: update it first"}
     if rules.get("cli") == "opencode" and not opencode_installed():
@@ -1698,7 +1747,10 @@ def uses_full_names(rules):
 def rules_reset(expected):
     if not REVISION.match(expected):
         return {"ok": False, "error": "the expected revision must be a whole number"}
-    return write_rules(default_rules(int(expected) + 1), int(expected))
+    rules = default_rules(int(expected) + 1)
+    if dispatcher_version()[1] < CODEX_DISPATCHER:
+        del rules["providers"]["codex"]  # an older mm-worker would call the defaults invalid
+    return write_rules(rules, int(expected))
 
 
 def rules_command(argv):
@@ -2156,14 +2208,13 @@ def read_tools(account, keys, system=None):
         used = newest_log(os.path.join(folder, "sessions"))
         if used is not None:
             codex_used = used if codex_used is None else max(codex_used, used)
-    codex_signed_in = any(os.path.isfile(os.path.join(folder, "auth.json")) for folder in CODEX_HOMES)
     return {
         "claude": {"installed": claude_installed(), "hasData": claude_used is not None,
                    "lastUsed": claude_used, "signedIn": claude_signed_in},
         "opencode": {"installed": opencode_installed(), "hasData": opencode_used is not None,
                      "lastUsed": opencode_used, "signedIn": opencode_signed_in},
         "codex": {"installed": codex_installed(), "hasData": codex_used is not None,
-                  "lastUsed": codex_used, "signedIn": codex_signed_in},
+                  "lastUsed": codex_used, "signedIn": codex_signed_in()},
     }
 
 
